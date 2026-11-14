@@ -1,4 +1,5 @@
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -157,3 +158,63 @@ class RuntimeChatTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class EntryPointTest(unittest.TestCase):
+    """Tests drove the app through TestClient, so a broken main() shipped.
+
+    These run the real entry point in a subprocess.
+    """
+
+    def test_main_binds_loopback_and_serves_health(self):
+        import os
+        import socket
+        import subprocess
+        import sys as _sys
+        import time as _time
+        import urllib.request
+
+        def free_port():
+            with socket.socket() as probe:
+                probe.bind(("127.0.0.1", 0))
+                return probe.getsockname()[1]
+
+        repo = Path(__file__).resolve().parents[1]
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        port = free_port()
+        env = {
+            **os.environ,
+            "NEXUS_CONFIG": str(Path(tmpdir.name) / "config.json"),
+            "NEXUS_PORT": str(port),
+            "NEXUS_HOST": "127.0.0.1",
+        }
+        proc = subprocess.Popen(
+            [_sys.executable, "server.py"],
+            cwd=str(repo), env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        self.addCleanup(proc.stdout.close)
+        try:
+            deadline = _time.time() + 60
+            body = None
+            while _time.time() < deadline:
+                if proc.poll() is not None:
+                    self.fail(f"server exited early:\n{proc.stdout.read()}")
+                try:
+                    with urllib.request.urlopen(
+                        f"http://127.0.0.1:{port}/health", timeout=2
+                    ) as response:
+                        body = response.read().decode()
+                    break
+                except Exception:
+                    _time.sleep(0.3)
+            self.assertIsNotNone(body, "server never became healthy")
+            self.assertIn('"status":"ok"', body)
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
