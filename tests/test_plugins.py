@@ -76,15 +76,33 @@ class LoadingTest(unittest.TestCase):
             "name": "hello", "version": "1.0", "host": "*",
             "permissions": ["tools"]},
             source=(
+                "_seen = {}\n"
                 "def setup(ctx):\n"
-                "    ctx.services['loaded'] = ctx.plugin_name\n"
+                "    _seen['name'] = ctx.plugin_name\n"
+                "    _seen['host_tools'] = ctx.services['tools']\n"
+                "def seen():\n"
+                "    return _seen\n"
                 "def greet(name):\n"
                 "    return f'hello {name}'\n"
             ))
-        manager = PluginManager(self.root, services={})
+        services = {"tools": object()}
+        manager = PluginManager(self.root, services=services)
         manager.activate("hello")
-        self.assertEqual(manager.services["loaded"], "hello")
+        self.assertIs(manager.call("hello", "seen")["host_tools"], services["tools"])
         self.assertEqual(manager.call("hello", "greet", "nexus"), "hello nexus")
+
+    def test_plugin_cannot_swap_host_services(self):
+        write_plugin(self.root, "writer", {
+            "name": "writer", "version": "1.0", "host": "*",
+            "permissions": ["tools"]},
+            source=(
+                "def setup(ctx):\n"
+                "    ctx.services['tools'] = 'hijacked'\n"
+            ))
+        manager = PluginManager(self.root, services={"tools": "real"})
+        self.assertIsNone(manager.activate("writer"))
+        self.assertEqual(manager.services["tools"], "real")
+        self.assertIn("writer", manager.errors)
 
     def test_manifest_only_plugin_activates_without_module(self):
         write_plugin(self.root, "declarative", {
@@ -270,3 +288,52 @@ class ExamplePluginTest(unittest.TestCase):
 
             runtime.plugins.deactivate("hello_tool")
             self.assertNotIn("hello_tool", [t["name"] for t in runtime.tools.specs()])
+
+
+class PermissionEnforcementTest(unittest.TestCase):
+    """Declared scopes must gate capability access, not just be recorded.
+
+    `context.services` was a plain dict. A plugin with `"permissions": []` could
+    read `services["tools"]` and register a tool into the live registry while
+    every permission API reported it had no scopes at all.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _activate(self, permissions, body):
+        write_plugin(self.root, "p", {
+            "name": "p", "version": "1.0", "host": "*",
+            "permissions": permissions}, source=body)
+        from nexus.tools.registry import build_default_registry
+        registry = build_default_registry()
+        manager = PluginManager(self.root, services={"tools": registry})
+        manager.activate("p")
+        return manager, registry
+
+    def test_plugin_without_tools_scope_cannot_reach_registry(self):
+        manager, registry = self._activate([], (
+            "def setup(ctx):\n"
+            "    ctx.services['tools']\n"
+        ))
+        self.assertIsNone(manager.modules.get("p"))
+        self.assertIn("lacks permission", manager.errors["p"])
+        self.assertEqual(manager.services["tools"].specs(), registry.specs())
+
+    def test_plugin_with_tools_scope_reaches_registry(self):
+        manager, registry = self._activate(["tools"], (
+            "def setup(ctx):\n"
+            "    ctx.services['tools']\n"
+        ))
+        self.assertIn("p", manager.modules)
+
+    def test_unknown_service_is_absent_not_silently_allowed(self):
+        manager, _ = self._activate([], (
+            "def setup(ctx):\n"
+            "    ctx.services['nope']\n"
+        ))
+        self.assertIn("KeyError", manager.errors["p"])
