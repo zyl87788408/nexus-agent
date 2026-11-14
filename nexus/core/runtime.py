@@ -121,6 +121,16 @@ class NexusRuntime:
             Sandbox(self.config.resolve_path("data/sandbox"))
         )
         if self.config.get("tools.allow_shell"):
+            # Shell commands are a second egress path: curl, git and python all
+            # reach the network without passing through nexus/net.py. Allowing
+            # both would make the offline guarantee untrue, so refuse instead of
+            # silently running with a promise the engine cannot keep.
+            if self.config.mode is Mode.OFFLINE:
+                raise ValueError(
+                    "tools.allow_shell cannot be combined with offline mode: "
+                    "shell commands reach the network without passing through "
+                    "nexus/net.py, which would break the offline guarantee"
+                )
             self.tools.grant("shell")
             self.tools.sandbox.allow_shell = True
 

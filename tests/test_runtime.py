@@ -200,3 +200,42 @@ class BackendEgressTest(unittest.TestCase):
             ):
                 offenders.append(path.name)
         self.assertEqual(offenders, [], f"direct network use in {offenders}")
+
+
+class OfflineShellInvariantTest(unittest.TestCase):
+    """OFFLINE mode promises no network egress.
+
+    Shell commands are a second egress path — curl, git and python reach the
+    network without touching nexus/net.py — so the two settings must not be
+    allowed together. Configuring them is a startup error, not a warning.
+    """
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _runtime(self, mode, allow_shell):
+        from nexus.config import Config
+        config = Config(self.root / "config.json", {
+            "mode": mode,
+            "tools": {"allow_shell": allow_shell},
+            "memory": {"db_path": str(self.root / "memory.db")},
+        })
+        return NexusRuntime(config)
+
+    def test_offline_with_shell_is_refused(self):
+        with self.assertRaises(ValueError) as caught:
+            self._runtime("offline", True)
+        self.assertIn("network", str(caught.exception))
+
+    def test_offline_without_shell_builds(self):
+        runtime = self._runtime("offline", False)
+        self.assertNotIn("shell", runtime.tools.allowed_scopes)
+
+    def test_shell_still_available_outside_offline(self):
+        runtime = self._runtime("auto", True)
+        self.assertIn("shell", runtime.tools.allowed_scopes)

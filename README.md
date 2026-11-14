@@ -11,8 +11,12 @@ Two design rules drive the whole codebase:
 1. **It never reports work it did not do.** A task only reaches `completed` after every
    step produced verified output. Every response states whether it came from a real model
    (`simulated: false`) or the fallback (`simulated: true`).
-2. **OFFLINE mode cannot reach the network.** All egress passes through `nexus/net.py`,
-   which refuses non-loopback connections before a socket is opened.
+2. **OFFLINE mode cannot reach the network.** All model and API egress passes through
+   `nexus/net.py`, which refuses non-loopback connections before a socket is opened.
+   Shell execution is the one path that could bypass that gate, so enabling
+   `tools.allow_shell` together with OFFLINE mode is rejected at startup rather than
+   running with a guarantee the engine cannot keep. In `auto`/`online` mode shell
+   commands are ordinary processes and are not subject to the egress policy.
 
 ---
 
@@ -159,7 +163,8 @@ Each event is a `chat.completion.chunk`, terminated by `data: [DONE]`.
 * API key (`NEXUS_API_KEY`) required on all mutating endpoints when configured.
 * CORS is an allow-list, never `*`.
 * Config file written `0600`; secrets are stored as environment-variable names, never values.
-* Tools run inside a filesystem jail; shell execution is off unless explicitly granted.
+* Tools run inside a filesystem jail; shell execution is off unless explicitly granted,
+  and cannot be granted in OFFLINE mode.
 
 ```bash
 export NEXUS_API_KEY=your-secret
