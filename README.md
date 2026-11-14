@@ -168,6 +168,64 @@ python server.py
 
 ---
 
+## Plugins
+
+A plugin is a directory with a `manifest.json` and a Python module. The host imports
+the module and calls `setup(context)`; whatever the plugin registers there is live in the
+running engine.
+
+```
+plugins/
+  hello_tool/
+    manifest.json
+    plugin.py
+```
+
+```json
+{
+  "name": "hello_tool",
+  "version": "1.0.0",
+  "host": ">=2.0",
+  "permissions": ["tools"],
+  "entry": "plugin.py"
+}
+```
+
+`name`, `version` and `host` are required. `permissions` must be a subset of
+`filesystem`, `model`, `tools`, `memory`; a manifest that fails validation is rejected
+rather than loaded in a degraded state.
+
+`setup(context)` receives the host services, so a plugin can add tools to the registry
+the engine actually uses:
+
+```python
+from nexus.tools.registry import ToolSpec
+
+_registry = None
+
+def setup(context):
+    global _registry
+    _registry = context.services["tools"]
+    _registry.register(ToolSpec(
+        name="hello_tool",
+        description="Return a greeting for the given name.",
+        handler=lambda name="world": f"hello, {name}",
+        scope="read",
+    ))
+
+def shutdown():
+    if _registry is not None:
+        _registry.unregister("hello_tool")
+```
+
+The full working version is in `examples/plugins/hello_tool/` and is exercised by the
+test suite. Point the host at it with `plugin_dir` or copy it into `plugins/`.
+
+A plugin that raises during import or `setup()` is contained: the error is recorded in
+`/api/plugins`, the plugin is disabled, and the rest of the engine keeps running.
+
+---
+
 ## Hardware adaptation
 
 `nexus/hardware/optimizer.py` derives a model budget from memory that is actually

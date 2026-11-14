@@ -239,3 +239,34 @@ class StatusTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class ExamplePluginTest(unittest.TestCase):
+    """The shipped example must actually work, otherwise it is documentation lies."""
+
+    def test_example_plugin_registers_and_cleans_up(self):
+        import tempfile
+        from nexus.config import Config
+        from nexus.core.runtime import NexusRuntime
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime = NexusRuntime(Config(root / "c.json", {
+                "mode": "offline",
+                "memory": {"db_path": str(root / "m.db")},
+                "execution": {"checkpoint_dir": str(root / "ck")},
+            }))
+            runtime.plugins.loader.plugin_dir = (
+                Path(__file__).resolve().parents[1] / "examples" / "plugins"
+            )
+
+            self.assertNotIn("hello_tool", [t["name"] for t in runtime.tools.specs()])
+            runtime.plugins.activate("hello_tool")
+            self.assertEqual(runtime.plugins.status()["errors"], {})
+
+            result = runtime.tools.call("hello_tool", name="nexus")
+            self.assertTrue(result.ok, result.error)
+            self.assertEqual(result.output, "hello, nexus")
+
+            runtime.plugins.deactivate("hello_tool")
+            self.assertNotIn("hello_tool", [t["name"] for t in runtime.tools.specs()])
