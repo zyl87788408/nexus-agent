@@ -175,9 +175,11 @@ python server.py
 
 ## Plugins
 
-A plugin is a directory with a `manifest.json` and a Python module. The host imports
-the module and calls `setup(context)`; whatever the plugin registers there is live in the
-running engine.
+A plugin is a directory with a `manifest.json` and a Python module. Every plugin found
+under the plugin directory is activated at startup, in name order: the host imports the
+module and calls `setup(context)`, and whatever the plugin registers there is live in the
+running engine. The directory is `plugins/` by default and can be moved with the
+`plugins` config key.
 
 Plugins are trusted code and run in-process: the manifest's `permissions` gate which
 host services (`tools`, `model`, `memory`, `filesystem`) the plugin can reach through
@@ -228,10 +230,27 @@ def shutdown():
 ```
 
 The full working version is in `examples/plugins/hello_tool/` and is exercised by the
-test suite. Point the host at it with `plugin_dir` or copy it into `plugins/`.
+test suite. Copy it into `plugins/` (or set `"plugins": "<path>"`) and restart; no code
+change is needed. `GET /api/plugins` reports what was discovered and activated:
+
+```json
+{"discovered": ["hello_tool"], "installed": ["hello_tool"],
+ "active": ["hello_tool"], "enabled": {"hello_tool": true}, "errors": {}}
+```
+
+There is no enable/disable endpoint yet: activation happens at startup and a plugin is
+live for the process lifetime. `deactivate()`, `uninstall()` and `activate_all()` exist on
+`PluginManager` for embedded use.
 
 A plugin that raises during import or `setup()` is contained: the error is recorded in
-`/api/plugins`, the plugin is disabled, and the rest of the engine keeps running.
+`/api/plugins` under `errors`, that plugin is not activated, and the rest of the engine —
+including other plugins — keeps running.
+
+Service access is gated fail-closed. `context.services` is a read-only mapping that
+checks a declared permission on every read; reading a name that is not a host capability
+raises `PermissionError` rather than reporting "missing". The host also refuses to start
+if it is handed a service with no permission mapping, because such a service would be
+readable by every plugin regardless of its manifest.
 
 ---
 

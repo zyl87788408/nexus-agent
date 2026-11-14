@@ -332,8 +332,112 @@ class PermissionEnforcementTest(unittest.TestCase):
         self.assertIn("p", manager.modules)
 
     def test_unknown_service_is_absent_not_silently_allowed(self):
+        """A name that is not a host capability must not be reachable.
+
+        The old code let the raw dict raise KeyError, which reads like a typo
+        rather than a refusal and let `in` return False while a real service of
+        that name would still be exposed. Unmapped names now fail closed with a
+        PermissionError naming the reason.
+        """
         manager, _ = self._activate([], (
             "def setup(ctx):\n"
             "    ctx.services['nope']\n"
         ))
-        self.assertIn("KeyError", manager.errors["p"])
+        self.assertIn("PermissionError", manager.errors["p"])
+        self.assertIn("not available to plugins", manager.errors["p"])
+
+    def test_unmapped_service_on_the_host_refuses_to_start(self):
+        """Host-level guard: an exposed service with no declared requirement
+        would be readable by every plugin, so construction fails loudly."""
+        from nexus.adapters.manager import PluginManager
+
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(ValueError) as caught:
+                PluginManager(d, services={"runtime": object()})
+        self.assertIn("no permission mapping", str(caught.exception))
+
+
+class AutoloadTest(unittest.TestCase):
+    """A plugin in `plugins/` must be live after startup, not merely discovered.
+
+    Nothing in the engine used to call activate(): /api/plugins listed the
+    plugin as discovered while its tools never entered the registry, so the
+    documented "whatever the plugin registers there is live" was false.
+    """
+
+    def test_discovered_plugins_are_activated_on_startup(self):
+        import pathlib
+        from nexus.config import Config
+        from nexus.core.runtime import NexusRuntime
+
+        with tempfile.TemporaryDirectory() as d:
+            root = pathlib.Path(d)
+            plugin_dir = root / "plugins" / "adder"
+            plugin_dir.mkdir(parents=True)
+            (plugin_dir / "manifest.json").write_text(
+                '{"name": "adder", "version": "1.0", "host": "*",'
+                ' "permissions": ["tools"], "entry": "plugin.py"}'
+            )
+            (plugin_dir / "plugin.py").write_text(
+                "def setup(ctx):\n"
+                "    from nexus.tools.registry import ToolSpec\n"
+                "    ctx.services['tools'].register(ToolSpec(\n"
+                "        name='adder', description='add', scope='compute',\n"
+                "        handler=lambda a=0, b=0: int(a) + int(b)))\n"
+            )
+
+            config = Config(root / "config.json", {
+                "mode": "offline",
+                "plugins": str(root / "plugins"),
+                "memory": {"db_path": str(root / "memory.db")},
+            })
+            runtime = NexusRuntime(config)
+
+            status = runtime.plugins.status()
+            self.assertEqual(status["discovered"], ["adder"])
+            self.assertEqual(status["active"], ["adder"])
+            self.assertIn("adder", runtime.tools.names())
+            result = runtime.tools.call("adder", a=2, b=3)
+            self.assertTrue(result.ok, result.error)
+            self.assertEqual(int(result.output), 5)
+
+    def test_active_plugin_survives_a_neighbour_that_fails(self):
+        """Fault isolation: one broken plugin must not take the others down."""
+        import pathlib
+        from nexus.config import Config
+        from nexus.core.runtime import NexusRuntime
+
+        with tempfile.TemporaryDirectory() as d:
+            root = pathlib.Path(d)
+            plugins = root / "plugins"
+            broken = plugins / "broken"
+            broken.mkdir(parents=True)
+            (broken / "manifest.json").write_text(
+                '{"name": "broken", "version": "1.0", "host": "*",'
+                ' "permissions": [], "entry": "plugin.py"}'
+            )
+            (broken / "plugin.py").write_text("def setup(ctx):\n    raise RuntimeError('boom')\n")
+            good = plugins / "good"
+            good.mkdir()
+            (good / "manifest.json").write_text(
+                '{"name": "good", "version": "1.0", "host": "*",'
+                ' "permissions": ["tools"], "entry": "plugin.py"}'
+            )
+            (good / "plugin.py").write_text(
+                "def setup(ctx):\n"
+                "    from nexus.tools.registry import ToolSpec\n"
+                "    ctx.services['tools'].register(ToolSpec(\n"
+                "        name='good', description='ok', scope='read',\n"
+                "        handler=lambda: 'ok'))\n"
+            )
+
+            config = Config(root / "config.json", {
+                "mode": "offline",
+                "plugins": str(plugins),
+                "memory": {"db_path": str(root / "memory.db")},
+            })
+            runtime = NexusRuntime(config)
+
+            self.assertIn("boom", runtime.plugins.errors["broken"])
+            self.assertIn("good", runtime.plugins.status()["active"])
+            self.assertIn("good", runtime.tools.names())

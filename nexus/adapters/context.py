@@ -8,6 +8,10 @@ scopes were recorded and documented but never consulted on that path.
 from collections.abc import Mapping
 
 # Which declared permission each built-in capability service requires.
+# Every service the host exposes must appear here. A service that is missing
+# from this map would be readable by a plugin holding no permissions at all, so
+# PluginManager refuses to start with an unmapped service rather than exposing
+# it by accident.
 SERVICE_PERMISSIONS = {
     "tools": "tools",
     "call_tool": "tools",
@@ -27,8 +31,15 @@ class GatedServices(Mapping):
         self._services = services
 
     def _check(self, key: str) -> None:
-        required = SERVICE_PERMISSIONS.get(key)
-        if required and not self._permissions.check(self._plugin_name, required):
+        if key not in SERVICE_PERMISSIONS:
+            # Fail closed: an unmapped service has no declared requirement, and
+            # guessing "no requirement" would defeat the gate.
+            raise PermissionError(
+                f"service {key!r} is not available to plugins "
+                f"(no permission mapping declared for it)"
+            )
+        required = SERVICE_PERMISSIONS[key]
+        if not self._permissions.check(self._plugin_name, required):
             raise PermissionError(
                 f"{self._plugin_name} lacks permission: {required} (needed for service {key!r})"
             )
@@ -72,11 +83,17 @@ class PluginContext:
             )
 
     def call_service(self, permission, service, *args, **kwargs):
-        self.require(permission)
+        """Invoke a named service after checking an explicit permission.
 
-        # `self.services` re-checks the capability's own permission on access.
+        Unlike `self.services[...]`, which gates by capability name, this path
+        takes the required permission from the caller and verifies it here, so
+        service names are free-form. The two paths stay separate: routing this
+        one through SERVICE_PERMISSIONS would reject names that are not
+        capabilities.
+        """
+        self.require(permission)
         try:
-            fn = self.services[service]
+            fn = self._services[service]
         except KeyError:
             raise RuntimeError(f"Service unavailable: {service}") from None
 

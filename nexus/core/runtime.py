@@ -145,9 +145,10 @@ class NexusRuntime:
         self.journal_dir = checkpoint_dir
 
         self.plugins = PluginManager(
-            self.config.resolve_path("plugins"),
-            services={"memory": self.memory, "tools": self.tools, "runtime": self},
+            self.config.resolve_path(self.config.get("plugins", "plugins")),
+            services={"memory": self.memory, "tools": self.tools},
         )
+        self.plugins.activate_all()
 
     # ----------------------------------------------------------------- policy
     def _build_policy(self) -> NetworkPolicy:

@@ -6,7 +6,7 @@ nothing ever loaded or called a plugin.
 
 from __future__ import annotations
 
-from nexus.adapters.context import PluginContext
+from nexus.adapters.context import SERVICE_PERMISSIONS, PluginContext
 from nexus.adapters.lifecycle import PluginLifecycle
 from nexus.adapters.loader import PluginLoadError, PluginLoader
 from nexus.adapters.permissions import PermissionManager
@@ -18,6 +18,14 @@ class PluginManager:
         self.lifecycle = PluginLifecycle()
         self.permissions = PermissionManager()
         self.services = services or {}
+        unmapped = sorted(set(self.services) - set(SERVICE_PERMISSIONS))
+        if unmapped:
+            # Exposing a service with no declared permission requirement would
+            # hand it to every plugin regardless of manifest. Refuse early.
+            raise ValueError(
+                f"plugin service(s) {unmapped} have no permission mapping in "
+                f"SERVICE_PERMISSIONS; declare a requirement or stop exposing them"
+            )
         self.modules: dict[str, object] = {}
         self.errors: dict[str, str] = {}
 
@@ -47,6 +55,21 @@ class PluginManager:
         self.modules[name] = module
         self.errors.pop(name, None)
         return module
+
+    def activate_all(self) -> dict[str, object]:
+        """Activate every discoverable plugin.
+
+        Discovery alone does nothing; the engine used to construct the host and
+        never call activate(), so a plugin placed in `plugins/` stayed inert
+        while /api/plugins reported it as discovered. Failures are contained per
+        plugin, so one bad plugin neither stops the others nor the engine.
+        """
+        started = {}
+        for name in self.discover():
+            module = self.activate(name)
+            if module is not None:
+                started[name] = module
+        return started
 
     def deactivate(self, name: str) -> None:
         module = self.modules.pop(name, None)
