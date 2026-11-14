@@ -73,6 +73,7 @@ class ModeRequest(BaseModel):
 
 class TaskRequest(BaseModel):
     goal: str
+    task_id: str | None = None
     resume_task_id: str | None = None
 
 
@@ -153,7 +154,25 @@ def run_task(request: TaskRequest, authorization: str | None = Header(default=No
         return _error(401, "Invalid API key", "authentication_error", "invalid_api_key")
     if not request.goal.strip():
         return _error(400, "'goal' must not be empty")
-    return runtime.run_task(request.goal, resume_task_id=request.resume_task_id)
+    return runtime.run_task(
+        request.goal,
+        task_id=request.task_id,
+        resume_task_id=request.resume_task_id,
+    )
+
+
+@app.post("/api/task/{task_id}/interrupt")
+def interrupt_task(task_id: str, authorization: str | None = Header(default=None)):
+    if not _authorized(authorization):
+        return _error(401, "Invalid API key", "authentication_error", "invalid_api_key")
+    if not runtime.interrupt(task_id):
+        return _error(404, f"no running task '{task_id}'", "not_found_error")
+    return {"interrupted": True, "task_id": task_id}
+
+
+@app.get("/api/tasks")
+def list_tasks():
+    return {"running": runtime.active_tasks()}
 
 
 @app.post("/api/team")

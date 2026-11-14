@@ -10,11 +10,39 @@ from __future__ import annotations
 from nexus.net import NetworkPolicy, NetworkError, request
 
 _PROBE_PROMPT = "ok"
+_CACHE_TTL_SECONDS = 30.0
+_cache: dict[tuple[str, str], tuple[float, dict]] = {}
+
+
+def clear_probe_cache() -> None:
+    _cache.clear()
 
 
 def probe_model(backend: str, name: str, *, timeout: float = 20,
-                policy: NetworkPolicy | None = None) -> dict:
-    """Run a tiny real inference. Returns {available, reason, latency_ms}."""
+                policy: NetworkPolicy | None = None,
+                use_cache: bool = True) -> dict:
+    """Run a tiny real inference. Returns {available, reason, latency_ms}.
+
+    A short TTL cache avoids re-probing the same model on every request, which
+    on CPU-only hardware costs seconds each time. Availability is re-checked
+    once the entry expires, so a stopped server is still detected.
+    """
+    import time
+
+    key = (backend, name)
+    if use_cache:
+        cached = _cache.get(key)
+        if cached and (time.time() - cached[0]) < _CACHE_TTL_SECONDS:
+            return dict(cached[1])
+
+    result = _probe_uncached(backend, name, timeout=timeout, policy=policy)
+    if use_cache:
+        _cache[key] = (time.time(), dict(result))
+    return result
+
+
+def _probe_uncached(backend: str, name: str, *, timeout: float,
+                    policy: NetworkPolicy | None) -> dict:
     import time
 
     started = time.time()

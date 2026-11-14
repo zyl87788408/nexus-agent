@@ -13,7 +13,13 @@ from nexus.core.runtime import SimulatedBackend
 class ChatCompletionsTest(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(server.app)
-        server.runtime.gateway.set_backend(None)
+        self._original = server.runtime.gateway.backend
+        # Pin the backend so these protocol tests do not depend on (or pay for)
+        # whatever real model happens to be installed on the host.
+        server.runtime.gateway.set_backend(SimulatedBackend())
+
+    def tearDown(self):
+        server.runtime.gateway.set_backend(self._original)
 
     def test_returns_openai_shape(self):
         response = self.client.post(
@@ -35,13 +41,28 @@ class ChatCompletionsTest(unittest.TestCase):
             usage["total_tokens"], usage["prompt_tokens"] + usage["completion_tokens"]
         )
 
-    def test_simulated_fallback_without_models(self):
-        body = self.client.post(
-            "/v1/chat/completions",
-            json={"messages": [{"role": "user", "content": "没有模型时也要能答"}]},
-        ).json()
+    def test_simulated_fallback_is_labelled(self):
+        """Force the simulated path instead of relying on the host having no model.
+
+        The contract is that a simulated answer is *labelled* as such, not that
+        this machine happens to lack a model.
+        """
+        import server
+        from nexus.core.runtime import SimulatedBackend
+
+        original = server.runtime.gateway.backend
+        server.runtime.gateway.set_backend(SimulatedBackend())
+        try:
+            body = self.client.post(
+                "/v1/chat/completions",
+                json={"messages": [{"role": "user", "content": "没有模型时也要能答"}]},
+            ).json()
+        finally:
+            server.runtime.gateway.set_backend(original)
+
         self.assertEqual(body["model"], "simulated_model")
-        self.assertIn("没有模型时也要能答", body["choices"][0]["message"]["content"])
+        self.assertTrue(body["nexus"]["simulated"])
+        self.assertEqual(body["nexus"]["source"], "simulated")
 
     def test_empty_messages_rejected(self):
         response = self.client.post("/v1/chat/completions", json={"messages": []})

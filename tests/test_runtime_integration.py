@@ -16,6 +16,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from nexus.config import Config, Mode
 from nexus.core.runtime import NexusRuntime, SimulatedBackend
+from nexus.models.cloud import CloudBackend
+from nexus.models.ollama import OllamaBackend
 from nexus.net import CloudBlockedError
 from tests.helpers import EchoBackend, FailingBackend, make_runtime, temp_config
 
@@ -96,11 +98,22 @@ class OfflineGuaranteeTest(unittest.TestCase):
         self.assertEqual(spy.external, [])
 
     def test_offline_never_selects_cloud_even_if_configured(self):
+        """Cloud consent must be irrelevant in offline mode.
+
+        This asserts on the invariant rather than on a particular machine's
+        model inventory: whether a local model exists or not, the chosen
+        backend must never be the cloud one.
+        """
         runtime = NexusRuntime(cloud_config(self.root, "offline", allow_cloud=True))
         model, simulated = runtime._resolve_backend()
-        self.assertTrue(simulated)
-        self.assertEqual(model, "simulated_model")
-        self.assertIsInstance(runtime.gateway.backend, SimulatedBackend)
+        self.assertNotEqual(model, "gpt-4o-mini")
+        self.assertNotIsInstance(runtime.gateway.backend, CloudBackend)
+        if simulated:
+            self.assertEqual(model, "simulated_model")
+            self.assertIsInstance(runtime.gateway.backend, SimulatedBackend)
+        else:
+            # A verified local model is the only acceptable non-simulated case.
+            self.assertIsInstance(runtime.gateway.backend, OllamaBackend)
 
     def test_cloud_denied_without_consent_in_online_mode(self):
         runtime = NexusRuntime(cloud_config(self.root, "online", allow_cloud=False))
@@ -317,3 +330,85 @@ class StatusAndModeTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class InterruptResumeTest(unittest.TestCase):
+    """Interrupt must actually stop work, and resume must actually skip it."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_interrupt_stops_a_running_task(self):
+        import threading
+        import time
+
+        class SlowBackend(EchoBackend):
+            def chat(self, messages):
+                time.sleep(0.4)
+                return "slow answer"
+
+        runtime = NexusRuntime(temp_config(self.root))
+        runtime.gateway.set_backend(SlowBackend(plan=["a", "b", "c", "d"]))
+        holder = {}
+
+        def run():
+            holder["out"] = runtime.run_task("slow", task_id="int-test")
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        time.sleep(1.0)
+        self.assertIn("int-test", runtime.active_tasks())
+        self.assertTrue(runtime.interrupt("int-test"))
+        thread.join(timeout=60)
+
+        self.assertEqual(holder["out"]["status"], "cancelled")
+        self.assertLess(holder["out"]["steps"], 4)
+
+    def test_interrupt_unknown_task_returns_false(self):
+        runtime = NexusRuntime(temp_config(self.root))
+        self.assertFalse(runtime.interrupt("no-such-task"))
+
+    def test_resume_skips_completed_steps_and_keeps_task_id(self):
+        import json as _json
+
+        runtime = NexusRuntime(temp_config(self.root))
+        backend = EchoBackend(plan=["one", "two", "three"])
+        runtime.gateway.set_backend(backend)
+
+        checkpoint_dir = self.root / "checkpoints"
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        (checkpoint_dir / "res-1.json").write_text(
+            _json.dumps({"plan": ["one", "two", "three"], "done_count": 2}))
+
+        result = runtime.run_task("continue", resume_task_id="res-1")
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["steps"], 3)
+        self.assertEqual(result["task_id"], "res-1")
+        # Only the third step was executed.
+        self.assertEqual(backend.chat_calls, 1)
+
+    def test_checkpoint_removed_after_successful_completion(self):
+        runtime = NexusRuntime(temp_config(self.root))
+        runtime.gateway.set_backend(EchoBackend(plan=["only"]))
+        runtime.run_task("done", task_id="cleanup-1")
+        self.assertFalse((self.root / "checkpoints" / "cleanup-1.json").exists())
+
+
+class InterruptEndpointTest(unittest.TestCase):
+    def setUp(self):
+        from fastapi.testclient import TestClient
+
+        import server
+        self.client = TestClient(server.app)
+
+    def test_tasks_endpoint_lists_running(self):
+        body = self.client.get("/api/tasks").json()
+        self.assertIn("running", body)
+
+    def test_interrupting_unknown_task_is_404(self):
+        response = self.client.post("/api/task/ghost/interrupt")
+        self.assertEqual(response.status_code, 404)

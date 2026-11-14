@@ -1,4 +1,5 @@
 import json
+import threading
 import sys
 from pathlib import Path
 
@@ -110,6 +111,9 @@ class NexusRuntime:
         self._simulated = None
         self._active_model = None
         self._active_source = None
+        # Live tasks, addressable by id so an interrupt can reach a running one.
+        self._active_tasks: dict[str, Task] = {}
+        self._tasks_lock = threading.Lock()
 
         self.policy = self._build_policy()
 
@@ -231,9 +235,12 @@ class NexusRuntime:
 
     def _resolve_backend(self, *, probe: bool = False):
         """Choose a backend while honouring the offline guarantee."""
+        # Any explicitly injected backend wins, including a simulated one: the
+        # caller asked for it, so discovery must not override that choice.
         backend = self.gateway.backend
-        if backend is not None and backend is not self._simulated:
-            return getattr(backend, "model", None) or "injected_model", False
+        if backend is not None:
+            model = getattr(backend, "model", None) or "injected_model"
+            return model, isinstance(backend, SimulatedBackend)
 
         mode = self.config.mode
         if mode is not Mode.ONLINE:
@@ -285,10 +292,14 @@ class NexusRuntime:
         target_model, simulated = self._resolve_backend()
         self._active_model = target_model
 
-        if simulated:
-            return self._simulated_backend().chat(messages), "simulated_model", "simulated"
-
         backend = self.gateway.backend
+        if simulated:
+            # Use the injected simulated backend when there is one, so a caller
+            # that supplied its own is genuinely used rather than replaced.
+            fallback = backend if isinstance(backend, SimulatedBackend) \
+                else self._simulated_backend()
+            return fallback.chat(messages), "simulated_model", "simulated"
+
         payload = list(messages)
         if use_memory:
             query = _last_user_content(messages)
@@ -380,27 +391,36 @@ class NexusRuntime:
             return False, "output only repeats the instruction"
         return True, ""
 
-    def run_task(self, task_goal: str, *, resume_task_id: str | None = None) -> dict:
+    def run_task(self, task_goal: str, *, resume_task_id: str | None = None,
+                 task_id: str | None = None) -> dict:
         target_model, simulated = self._resolve_backend(probe=True)
         self._active_model = target_model
 
         task = Task(goal=task_goal)
         if resume_task_id:
             task.task_id = resume_task_id
+        elif task_id:
+            task.task_id = task_id
 
         journal = Journal(self.journal_dir, task.task_id)
         planner = None if simulated else self.planner
 
-        result = run_execution_loop(
-            task,
-            self._step_executor(lambda: simulated),
-            planner=planner,
-            verify=self._verify_step,
-            max_retries=self.config.get("execution.max_retries", 2),
-            journal=journal,
-            checkpoint=self.checkpoint,
-            resume=bool(resume_task_id),
-        )
+        with self._tasks_lock:
+            self._active_tasks[task.task_id] = task
+        try:
+            result = run_execution_loop(
+                task,
+                self._step_executor(lambda: simulated),
+                planner=planner,
+                verify=self._verify_step,
+                max_retries=self.config.get("execution.max_retries", 2),
+                journal=journal,
+                checkpoint=self.checkpoint,
+                resume=bool(resume_task_id),
+            )
+        finally:
+            with self._tasks_lock:
+                self._active_tasks.pop(task.task_id, None)
 
         result["model"] = "simulated_model" if simulated else target_model
         result["source"] = self._active_source
@@ -408,6 +428,19 @@ class NexusRuntime:
         result["simulated"] = simulated
         result["journal"] = str(journal.path)
         return result
+
+    def interrupt(self, task_id: str) -> bool:
+        """Request cancellation of a running task. False if no such task."""
+        with self._tasks_lock:
+            task = self._active_tasks.get(task_id)
+        if task is None:
+            return False
+        task.cancel()
+        return True
+
+    def active_tasks(self) -> list[str]:
+        with self._tasks_lock:
+            return sorted(self._active_tasks)
 
     def execute(self, goal: str, *, resume_task_id: str | None = None) -> dict:
         """Convenience wrapper with progress output."""
