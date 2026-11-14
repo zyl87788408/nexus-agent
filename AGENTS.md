@@ -58,6 +58,15 @@ These were each violated at some point and fixed; keep them fixed.
 * **Rejected manifests are reported, not dropped.** Discovery returns skip reasons keyed
   by directory; duplicate plugin names are rejects too. Silent absence made a typo look
   like an empty plugin directory.
+* **"Disabled" must mean it cannot act.** `PluginManager.disable()` removes the plugin's
+  tools from the registry and revokes its grants; it does not just flip a flag. Anything
+  that only hides a plugin from `/api/plugins` while leaving it callable is wrong.
+* **Tool ownership is tracked per plugin.** Plugins get an `OwnedToolRegistry`, not the
+  raw registry, so they cannot `replace=True` a host tool or unregister someone else's.
+  Handing out the raw registry reintroduces a privilege escalation (verified: a plugin
+  rewrote `run_shell`'s scope from `shell` to `read`).
+* **Enable/disable state is persisted** to `plugins_disabled`; a restart must not
+  resurrect a plugin the operator turned off.
 * **Plugins are trusted in-process code.** The loader gives each plugin its own module
   name to avoid import collisions and contains failures; it is not a sandbox. Do not
   describe it as one.

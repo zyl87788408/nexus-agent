@@ -6,15 +6,21 @@ nothing ever loaded or called a plugin.
 
 from __future__ import annotations
 
-from nexus.adapters.context import SERVICE_PERMISSIONS, PluginContext
+from nexus.adapters.context import (
+    SERVICE_PERMISSIONS,
+    OwnedToolRegistry,
+    PluginContext,
+)
 from nexus.adapters.lifecycle import PluginLifecycle
 from nexus.adapters.loader import PluginLoadError, PluginLoader
 from nexus.adapters.permissions import PermissionManager
 
 
 class PluginManager:
-    def __init__(self, plugin_dir="plugins", services: dict | None = None):
+    def __init__(self, plugin_dir="plugins", services: dict | None = None,
+                 config=None):
         self.loader = PluginLoader(plugin_dir)
+        self.config = config
         self.lifecycle = PluginLifecycle()
         self.permissions = PermissionManager()
         self.services = services or {}
@@ -28,6 +34,12 @@ class PluginManager:
             )
         self.modules: dict[str, object] = {}
         self.errors: dict[str, str] = {}
+        # Tools each plugin registered, so deactivation removes exactly those and
+        # nothing of the host's or a neighbour's.
+        self.owned: dict[str, set[str]] = {}
+        # Survives restarts: a disabled plugin stays disabled until re-enabled.
+        persisted = config.get("plugins_disabled", []) if config is not None else []
+        self.disabled: set[str] = set(persisted or [])
 
     # ------------------------------------------------------------ management
     def install(self, name: str) -> dict:
@@ -40,11 +52,25 @@ class PluginManager:
         self.permissions.grant(name, manifest.get("permissions", []))
         return manifest
 
+    def _context_services(self, name: str) -> dict:
+        """Services for one plugin, with the tool registry wrapped in its own view."""
+        services = dict(self.services)
+        registry = services.get("tools")
+        if registry is not None and hasattr(registry, "register"):
+            services["tools"] = OwnedToolRegistry(
+                name, registry, self.owned.setdefault(name, set())
+            )
+        return services
+
     def activate(self, name: str):
         """Install (if needed) then import and run setup()."""
+        if name in self.disabled:
+            raise PluginLoadError(
+                f"plugin {name!r} is disabled; enable it before activating"
+            )
         manifest = self.install(name)
         self.lifecycle.enable(name)
-        context = PluginContext(name, self.permissions, self.services)
+        context = PluginContext(name, self.permissions, self._context_services(name))
         registry = self.services.get("tools")
         trackable = registry is not None and hasattr(registry, "names")
         before = set(registry.names()) if trackable else set()
@@ -57,6 +83,7 @@ class PluginManager:
             if trackable:
                 for tool in set(registry.names()) - before:
                     registry.unregister(tool)
+            self.owned.pop(name, None)
             self.permissions.revoke(name)
             self.errors[name] = str(exc)
             self.lifecycle.disable(name)
@@ -66,7 +93,7 @@ class PluginManager:
         return module
 
     def activate_all(self) -> dict[str, object]:
-        """Activate every discoverable plugin.
+        """Activate every discoverable plugin that is not disabled.
 
         Discovery alone does nothing; the engine used to construct the host and
         never call activate(), so a plugin placed in `plugins/` stayed inert
@@ -75,16 +102,59 @@ class PluginManager:
         """
         started = {}
         for name in self.discover():
+            if name in self.disabled:
+                continue
             module = self.activate(name)
             if module is not None:
                 started[name] = module
         return started
 
-    def deactivate(self, name: str) -> None:
+    # ------------------------------------------------------- enable / disable
+    def _persist_disabled(self) -> None:
+        if self.config is not None:
+            self.config.set("plugins_disabled", sorted(self.disabled))
+            self.config.save()
+
+    def _release(self, name: str) -> None:
+        """Undo everything an activation did, leaving the plugin installed."""
         module = self.modules.pop(name, None)
         if module is not None:
             self.loader.unload(module)
-        self.lifecycle.disable(name)
+        registry = self.services.get("tools")
+        if registry is not None and hasattr(registry, "unregister"):
+            for tool in sorted(self.owned.pop(name, set())):
+                registry.unregister(tool)
+        if name in self.lifecycle.plugins:
+            self.lifecycle.disable(name)
+        self.permissions.revoke(name)
+
+    def disable(self, name: str) -> dict:
+        """Turn a plugin off now and keep it off across restarts.
+
+        Deactivation removes the tools it registered and revokes its grants, so
+        "disabled" means the plugin really cannot act - not merely that it is
+        hidden from a list. The manifest stays installed, so enabling it again
+        needs no reinstall.
+        """
+        if name not in self.discover():
+            raise PluginLoadError(f"plugin {name!r} not found")
+        self._release(name)
+        self.disabled.add(name)
+        self._persist_disabled()
+        self.errors.pop(name, None)
+        return self.status()
+
+    def enable(self, name: str) -> dict:
+        """Turn a disabled plugin back on, activating it immediately."""
+        if name not in self.discover():
+            raise PluginLoadError(f"plugin {name!r} not found")
+        self.disabled.discard(name)
+        self._persist_disabled()
+        self.activate(name)
+        return self.status()
+
+    def deactivate(self, name: str) -> None:
+        self._release(name)
 
     def uninstall(self, name: str) -> None:
         self.deactivate(name)
@@ -122,10 +192,12 @@ class PluginManager:
         # manifest is visible instead of silently absent from the list.
         for directory, reason in skipped.items():
             errors.setdefault(directory, reason)
+        enabled = self.lifecycle.status()
         return {
             "discovered": self.discover(),
             "installed": sorted(self.lifecycle.plugins),
             "active": sorted(self.modules),
-            "enabled": self.lifecycle.status(),
+            "enabled": enabled,
+            "disabled": sorted(self.disabled),
             "errors": errors,
         }

@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from nexus.config import Config, Mode
 from nexus.core.runtime import NexusRuntime
+from nexus.adapters.loader import PluginLoadError
 from nexus.net import CloudBlockedError
 
 config = Config.load()
@@ -245,6 +246,42 @@ def memory_delete(memory_id: str,
 @app.get("/api/plugins")
 def plugins():
     return runtime.plugins.status()
+
+
+class PluginStateRequest(BaseModel):
+    enabled: bool
+
+
+@app.post("/api/plugins/{name}/enable")
+def enable_plugin(name: str, authorization: str | None = Header(default=None)):
+    if not _authorized(authorization):
+        return _error(401, "Invalid API key", "authentication_error", "invalid_api_key")
+    try:
+        return runtime.plugins.enable(name)
+    except PluginLoadError as exc:
+        return _error(404, str(exc), "not_found_error")
+
+
+@app.post("/api/plugins/{name}/disable")
+def disable_plugin(name: str, authorization: str | None = Header(default=None)):
+    if not _authorized(authorization):
+        return _error(401, "Invalid API key", "authentication_error", "invalid_api_key")
+    try:
+        return runtime.plugins.disable(name)
+    except PluginLoadError as exc:
+        return _error(404, str(exc), "not_found_error")
+
+
+@app.post("/api/plugins/{name}")
+def set_plugin_state(name: str, request: PluginStateRequest,
+                     authorization: str | None = Header(default=None)):
+    if not _authorized(authorization):
+        return _error(401, "Invalid API key", "authentication_error", "invalid_api_key")
+    try:
+        return (runtime.plugins.enable(name) if request.enabled
+                else runtime.plugins.disable(name))
+    except PluginLoadError as exc:
+        return _error(404, str(exc), "not_found_error")
 
 
 @app.get("/v1/models")

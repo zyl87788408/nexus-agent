@@ -237,3 +237,80 @@ class SecurityTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class PluginEndpointTest(unittest.TestCase):
+    """The HTTP surface of enable/disable, including auth and 404 handling."""
+
+    def setUp(self):
+        self.client = TestClient(server.app)
+        self.plugins = server.runtime.plugins
+        self.saved_key = server.API_KEY
+        self.original_disabled = set(self.plugins.disabled)
+        self.original_config = self.plugins.config
+
+    def tearDown(self):
+        self.plugins.disabled = self.original_disabled
+        self.plugins.config = self.original_config
+        server.API_KEY = self.saved_key
+
+    def _auth(self):
+        return {"Authorization": f"Bearer {server.API_KEY}"} if server.API_KEY else {}
+
+    def test_status_reports_a_disabled_list(self):
+        body = self.client.get("/api/plugins", headers=self._auth()).json()
+        self.assertIn("disabled", body)
+        self.assertIsInstance(body["disabled"], list)
+
+    def test_unknown_plugin_disable_returns_404(self):
+        response = self.client.post("/api/plugins/no-such-plugin/disable",
+                                    headers=self._auth())
+        self.assertEqual(response.status_code, 404)
+        self.assertIn("not found", response.json()["error"]["message"])
+
+    def test_unknown_plugin_enable_returns_404(self):
+        response = self.client.post("/api/plugins/no-such-plugin/enable",
+                                    headers=self._auth())
+        self.assertEqual(response.status_code, 404)
+
+    def test_state_endpoint_requires_auth_when_a_key_is_configured(self):
+        server.API_KEY = "secret-key"
+        response = self.client.post("/api/plugins/no-such-plugin/disable")
+        self.assertEqual(response.status_code, 401)
+
+    def test_state_endpoint_toggles_via_the_generic_route(self):
+        from nexus.adapters.manager import PluginManager
+        from nexus.tools.registry import build_default_registry
+
+        with tempfile.TemporaryDirectory() as d:
+            plugin_dir = Path(d) / "demo"
+            plugin_dir.mkdir()
+            (plugin_dir / "manifest.json").write_text(
+                '{"name": "demo", "version": "1.0", "host": "*",'
+                ' "permissions": ["tools"], "entry": "plugin.py"}'
+            )
+            (plugin_dir / "plugin.py").write_text(
+                "def setup(ctx):\n"
+                "    from nexus.tools.registry import ToolSpec\n"
+                "    ctx.services['tools'].register(ToolSpec(\n"
+                "        name='demo_tool', description='x', scope='read',\n"
+                "        handler=lambda: 'ran'))\n"
+            )
+            registry = build_default_registry()
+            manager = PluginManager(d, services={"tools": registry})
+            manager.activate_all()
+            server.runtime.plugins = manager
+            try:
+                body = self.client.post("/api/plugins/demo", json={"enabled": False},
+                                        headers=self._auth()).json()
+                self.assertEqual(body["disabled"], ["demo"])
+                self.assertEqual(body["active"], [])
+                self.assertNotIn("demo_tool", registry.names())
+
+                body = self.client.post("/api/plugins/demo", json={"enabled": True},
+                                        headers=self._auth()).json()
+                self.assertEqual(body["disabled"], [])
+                self.assertEqual(body["active"], ["demo"])
+                self.assertIn("demo_tool", registry.names())
+            finally:
+                server.runtime.plugins = self.plugins

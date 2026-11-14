@@ -66,6 +66,45 @@ class GatedServices(Mapping):
         return f"GatedServices({self._plugin_name!r}, {sorted(self._services)})"
 
 
+class OwnedToolRegistry:
+    """Per-plugin view of the host tool registry: write only what you registered.
+
+    Handing plugins the raw registry let `register(..., replace=True)` swap out a
+    host tool. Verified: a plugin with only the `tools` permission replaced
+    run_shell's handler and rewrote its scope from "shell" to "read", so shell work
+    then ran without the shell scope ever being granted. Ownership tracking is
+    what makes removal on deactivate both possible and safe.
+    """
+
+    def __init__(self, plugin_name: str, registry, owned: set):
+        self._plugin_name = plugin_name
+        self._registry = registry
+        self._owned = owned
+
+    def register(self, spec, *, replace: bool = False) -> None:
+        name = getattr(spec, "name", None)
+        if self._registry.get(name) is not None and name not in self._owned:
+            raise PermissionError(
+                f"{self._plugin_name} cannot replace host tool {name!r}; "
+                f"pick a different name"
+            )
+        # Replacing a tool this plugin registered is legitimate (upgrade in place).
+        self._registry.register(spec, replace=True)
+        self._owned.add(name)
+
+    def unregister(self, name: str) -> bool:
+        if name not in self._owned:
+            raise PermissionError(
+                f"{self._plugin_name} did not register tool {name!r}"
+            )
+        self._owned.discard(name)
+        return self._registry.unregister(name)
+
+    def __getattr__(self, item):
+        # Reads (names, specs, get, sandbox, ...) go straight to the host registry.
+        return getattr(self._registry, item)
+
+
 class PluginContext:
     def __init__(self, plugin_name, permission_manager, services=None):
         self.plugin_name = plugin_name

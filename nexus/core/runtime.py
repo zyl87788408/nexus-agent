@@ -147,6 +147,7 @@ class NexusRuntime:
         self.plugins = PluginManager(
             self.config.resolve_path(self.config.get("plugins", "plugins")),
             services={"memory": self.memory, "tools": self.tools},
+            config=self.config,
         )
         self.plugins.activate_all()
 

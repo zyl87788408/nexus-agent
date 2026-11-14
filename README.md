@@ -238,9 +238,28 @@ change is needed. `GET /api/plugins` reports what was discovered and activated:
  "active": ["hello_tool"], "enabled": {"hello_tool": true}, "errors": {}}
 ```
 
-There is no enable/disable endpoint yet: activation happens at startup and a plugin is
-live for the process lifetime. `deactivate()`, `uninstall()` and `activate_all()` exist on
-`PluginManager` for embedded use.
+### Enabling and disabling at runtime
+
+```
+POST /api/plugins/{name}/disable    # turn it off, and keep it off
+POST /api/plugins/{name}/enable     # turn it back on, immediately
+POST /api/plugins/{name}            # {"enabled": false} - same thing, one route
+```
+
+Disabling is not cosmetic: the plugin's tools are removed from the registry and its
+permissions are revoked, so calls fail with `unknown tool` rather than merely being
+hidden from a list. Enabling imports and runs `setup()` again, so the tools come back.
+The choice is written to `plugins_disabled` in the config file and survives a restart —
+otherwise a restart would quietly undo an operator's decision to turn something off.
+
+Both routes require the API key when one is configured, and return 404 for a plugin that
+does not exist. There is still no endpoint to *install* a plugin from a URL or archive:
+plugins are directories on disk, picked up at startup.
+
+A plugin may only register tools with names it owns. Registering a name that a host tool
+already uses (including with `replace=True`) fails with `PermissionError`, and so does
+unregistering a tool the plugin did not register. Without that, a plugin holding only the
+`tools` permission could replace `run_shell` and rewrite its scope.
 
 A plugin that raises during import or `setup()` is contained: the error is recorded in
 `/api/plugins` under `errors`, that plugin is not activated, and the rest of the engine —
