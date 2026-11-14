@@ -142,17 +142,27 @@ class OnlineModeTest(unittest.TestCase):
                                timeout=1)
         attempted = []
 
+        real_getaddrinfo = socket.getaddrinfo
         real_connect = socket.socket.connect
 
+        def resolve(host, *args, **kwargs):
+            attempted.append(("dns", host))
+            return real_getaddrinfo(host, *args, **kwargs)
+
         def refuse(sock, address):
-            attempted.append(address)
+            attempted.append(("connect", address))
             raise ConnectionRefusedError("test: outbound blocked")
 
+        # Patch name resolution too: with no network at all, DNS fails before
+        # connect() is ever called, and the test must still prove that the
+        # offline guard let the attempt through.
+        socket.getaddrinfo = resolve
         socket.socket.connect = refuse
         try:
             with self.assertRaises(NetworkError):
                 backend.chat([{"role": "user", "content": "hi"}])
         finally:
+            socket.getaddrinfo = real_getaddrinfo
             socket.socket.connect = real_connect
 
         self.assertTrue(attempted, "online mode did not attempt any connection")
