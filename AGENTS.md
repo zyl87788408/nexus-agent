@@ -42,6 +42,27 @@ Run the full suite before committing. It is fast; there is no excuse to skip it.
 * `nexus/tools/sandbox.py`: path jail; shell off by default.
 * `nexus/adapters/`: plugin loader, manager, permissions, context.
 
+## Security invariants that are easy to break
+
+These were each violated at some point and fixed; keep them fixed.
+
+* **Capability access goes through the permission gate.** `PluginContext.services` is a
+  `GatedServices` mapping, not the host dict. Reading `services["tools"|"memory"|
+  "model"|"filesystem"]` requires the matching manifest permission and raises
+  `PermissionError` otherwise; assignment raises `TypeError`. Never hand a plugin the raw
+  host mapping again.
+* **Plugins are trusted in-process code.** The loader gives each plugin its own module
+  name to avoid import collisions and contains failures; it is not a sandbox. Do not
+  describe it as one.
+* **OFFLINE means no egress, and that is enforced in one place.** Model/API traffic goes
+  through `nexus/net.py`. `tools.allow_shell` is a second path (curl/git/python), so
+  combining it with OFFLINE mode is a startup `ValueError`. Filtering shell commands for
+  network use was rejected as unreliable; do not replace the refusal with a filter.
+* **Evidence, not output.** A step only counts as completed when its output is verified
+  and is not merely an echo of its own instruction.
+* **No fabricated hardware or results.** `gpu: None` when there is no GPU; fallback
+  output is labelled `simulated: true`.
+
 ## Testing conventions
 
 * Prefer real code paths. `tests/helpers.py::EchoBackend` is a genuine `ModelBackend`,
