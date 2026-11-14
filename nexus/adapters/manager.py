@@ -45,10 +45,19 @@ class PluginManager:
         manifest = self.install(name)
         self.lifecycle.enable(name)
         context = PluginContext(name, self.permissions, self.services)
+        registry = self.services.get("tools")
+        trackable = registry is not None and hasattr(registry, "names")
+        before = set(registry.names()) if trackable else set()
         try:
             module = self.loader.load(name, context)
         except PluginLoadError as exc:
-            # Plugin failures are contained: record and disable, never propagate.
+            # A setup() that fails halfway has already registered whatever it
+            # managed to add. Leaving those behind means an inert plugin still
+            # contributes callable tools, so undo everything it added.
+            if trackable:
+                for tool in set(registry.names()) - before:
+                    registry.unregister(tool)
+            self.permissions.revoke(name)
             self.errors[name] = str(exc)
             self.lifecycle.disable(name)
             return None
@@ -107,10 +116,16 @@ class PluginManager:
         return [p["name"] for p in self.loader.discover()]
 
     def status(self) -> dict:
+        _, skipped = self.loader.discover_detailed()
+        errors = dict(self.errors)
+        # Skipped directories are reported under the directory name so a broken
+        # manifest is visible instead of silently absent from the list.
+        for directory, reason in skipped.items():
+            errors.setdefault(directory, reason)
         return {
             "discovered": self.discover(),
             "installed": sorted(self.lifecycle.plugins),
             "active": sorted(self.modules),
             "enabled": self.lifecycle.status(),
-            "errors": dict(self.errors),
+            "errors": errors,
         }

@@ -51,6 +51,13 @@ These were each violated at some point and fixed; keep them fixed.
   "model"|"filesystem"]` requires the matching manifest permission and raises
   `PermissionError` otherwise; assignment raises `TypeError`. Never hand a plugin the raw
   host mapping again.
+* **A plugin that fails to start must leave nothing behind.** `setup()` can register
+  tools and then raise. `PluginManager.activate()` snapshots the tool registry and
+  unregisters whatever the failed plugin added; do not treat "not in `modules`" as
+  enough to mean "not active".
+* **Rejected manifests are reported, not dropped.** Discovery returns skip reasons keyed
+  by directory; duplicate plugin names are rejects too. Silent absence made a typo look
+  like an empty plugin directory.
 * **Plugins are trusted in-process code.** The loader gives each plugin its own module
   name to avoid import collisions and contains failures; it is not a sandbox. Do not
   describe it as one.

@@ -2,6 +2,7 @@
 
 import json
 import sys
+import pathlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -441,3 +442,75 @@ class AutoloadTest(unittest.TestCase):
             self.assertIn("boom", runtime.plugins.errors["broken"])
             self.assertIn("good", runtime.plugins.status()["active"])
             self.assertIn("good", runtime.tools.names())
+
+
+class FailureRollbackTest(unittest.TestCase):
+    """A setup() that dies halfway must not leave its work behind.
+
+    Registering a tool and then raising is the realistic shape of a broken
+    plugin. The tool stayed in the live registry, so an inert plugin still
+    contributed a callable tool and /api/plugins disagreed with reality.
+    """
+
+    def _manager(self, directory: pathlib.Path, name: str, code: str,
+                 permissions="\"tools\"", manifest_name=None):
+        plugin_dir = directory / name
+        plugin_dir.mkdir(parents=True)
+        (plugin_dir / "manifest.json").write_text(
+            '{"name": "%s", "version": "1.0", "host": "*",'
+            ' "permissions": [%s], "entry": "plugin.py"}'
+            % (manifest_name or name, permissions)
+        )
+        (plugin_dir / "plugin.py").write_text(code)
+        return plugin_dir
+
+    def test_tools_registered_before_a_failure_are_removed(self):
+        from nexus.adapters.manager import PluginManager
+        from nexus.tools.registry import build_default_registry
+
+        with tempfile.TemporaryDirectory() as d:
+            root = pathlib.Path(d)
+            self._manager(root, "half", (
+                "def setup(ctx):\n"
+                "    from nexus.tools.registry import ToolSpec\n"
+                "    ctx.services['tools'].register(ToolSpec(\n"
+                "        name='half_tool', description='x', scope='read',\n"
+                "        handler=lambda: 'leaked'))\n"
+                "    raise RuntimeError('boom')\n"
+            ))
+            registry = build_default_registry()
+            manager = PluginManager(root, services={"tools": registry})
+            manager.activate_all()
+
+            self.assertIn("boom", manager.errors["half"])
+            self.assertNotIn("half", manager.modules)
+            self.assertNotIn("half_tool", registry.names())
+            self.assertEqual(manager.permissions.list_permissions("half"), [])
+
+    def test_invalid_manifest_is_reported_not_silently_dropped(self):
+        from nexus.adapters.manager import PluginManager
+        from nexus.tools.registry import build_default_registry
+
+        with tempfile.TemporaryDirectory() as d:
+            root = pathlib.Path(d)
+            self._manager(root, "badperm", "", permissions="\"root\"")
+            manager = PluginManager(root, services={"tools": build_default_registry()})
+
+            status = manager.status()
+            self.assertEqual(status["discovered"], [])
+            self.assertIn("badperm", status["errors"])
+            self.assertIn("unknown permission", status["errors"]["badperm"])
+
+    def test_duplicate_plugin_names_are_reported(self):
+        from nexus.adapters.manager import PluginManager
+        from nexus.tools.registry import build_default_registry
+
+        with tempfile.TemporaryDirectory() as d:
+            root = pathlib.Path(d)
+            self._manager(root, "dup1", "", permissions="", manifest_name="same")
+            self._manager(root, "dup2", "", permissions="", manifest_name="same")
+            manager = PluginManager(root, services={"tools": build_default_registry()})
+
+            status = manager.status()
+            self.assertEqual(status["discovered"], ["same"])
+            self.assertIn("duplicate plugin name", status["errors"]["dup2"])

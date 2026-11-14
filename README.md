@@ -244,7 +244,11 @@ live for the process lifetime. `deactivate()`, `uninstall()` and `activate_all()
 
 A plugin that raises during import or `setup()` is contained: the error is recorded in
 `/api/plugins` under `errors`, that plugin is not activated, and the rest of the engine —
-including other plugins — keeps running.
+including other plugins — keeps running. Anything it registered before failing is rolled
+back, so a half-initialised plugin never leaves callable tools in the registry.
+
+A manifest that fails validation, and a second plugin declaring a name that is already
+taken, are both reported under `errors` keyed by directory rather than dropped silently.
 
 Service access is gated fail-closed. `context.services` is a read-only mapping that
 checks a declared permission on every read; reading a name that is not a host capability
