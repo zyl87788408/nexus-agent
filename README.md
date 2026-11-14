@@ -1,240 +1,241 @@
 # NEXUS Agent
 
-> **A lightweight local AI engine plugin that speaks the OpenAI API — with built-in memory-safety estimation.**
+> **A local AI agent engine with a drop-in OpenAI-compatible API, verified task execution, and a hard offline guarantee.**
 
-NEXUS Agent is a small, dependency-light engine that exposes a **drop-in OpenAI-compatible
-HTTP endpoint**. Any host engine that supports the OpenAI protocol — **OpenHands**,
-**LangChain**, the official `openai` SDK, Continue, LM Studio-style clients, and so on —
-can point at NEXUS and start chatting.
+NEXUS Agent runs AI tasks on your own machine. It exposes the OpenAI chat-completions
+protocol, so OpenHands, LangChain, the official `openai` SDK and similar hosts can point at
+it without changes.
 
-No cloud dependency. No GPU required. **If no local model is found, NEXUS automatically
-falls back to `SimulatedBackend`, so the project runs successfully on any machine.**
+Two design rules drive the whole codebase:
+
+1. **It never reports work it did not do.** A task only reaches `completed` after every
+   step produced verified output. Every response states whether it came from a real model
+   (`simulated: false`) or the fallback (`simulated: true`).
+2. **OFFLINE mode cannot reach the network.** All egress passes through `nexus/net.py`,
+   which refuses non-loopback connections before a socket is opened.
 
 ---
 
-## Features
+## What it does
 
-| Feature | Description |
+| Capability | Details |
 | --- | --- |
-| **OpenAI-compatible API** | `POST /v1/chat/completions` with standard `chat.completion` JSON, plus SSE streaming (`stream: true`). |
-| **Works out of the box** | No Ollama / llama.cpp required. A built-in simulated backend answers when no model is reachable. |
-| **Automatic backend discovery** | Detects models via Ollama (`127.0.0.1:11434`) and llama.cpp (`127.0.0.1:8080`), then auto-selects. |
-| **Built-in memory-safety estimation** | Estimates whether a model fits in available RAM *before* loading it — no more OOM crashes. |
-| **Hardware-aware planning** | Detects RAM/CPU and adapts the execution profile (Lite / Balanced / Performance). |
-| **Task planner + execution loop** | Decomposes a goal into steps and executes them with step limits and cancellation. |
-| **Plugin subsystem** | Manifest validation, permission scopes, lifecycle management. |
+| **OpenAI-compatible API** | `POST /v1/chat/completions` with standard `chat.completion` JSON, SSE streaming, and `GET /v1/models`. |
+| **Three operating modes** | `offline` (loopback only, structurally), `online` (cloud allowed with consent), `auto` (local first, cloud as fallback). |
+| **Verified task execution** | Plan, execute, verify. Evidence is mandatory; retries are bounded; per-step journal and resumable checkpoints. |
+| **Local model management** | Discovers Ollama / llama.cpp models, probes whether they actually run, and picks the largest that fits the RAM budget. |
+| **Cloud model integration** | Any OpenAI-compatible endpoint, gated by mode and explicit consent. |
+| **Hardware adaptation** | Detects CPU / RAM / GPU / VRAM / disk and derives a model budget and execution profile from what is really available. |
+| **Plugin system** | Manifest validation, real module import in an isolated namespace, permission scopes, lifecycle hooks, fault isolation. |
+| **Long-term memory** | SQLite with FTS5 full-text search (LIKE fallback), tags, importance, backup/restore. |
+| **Multi-agent collaboration** | Specialist agents run with bounded concurrency, isolated failures, and conflict detection. |
+| **Tool calling + sandbox** | Filesystem jail, traversal/symlink escape rejection, credential-path denial, dangerous-command deny-list, disabled by default. |
+| **Runtime status** | Mode, hardware profile, tools, plugins, memory counts, and whether output is simulated. |
 
 ---
 
 ## Quick start
 
 ```bash
-git clone <your-repo-url> nexus-agent
+git clone https://github.com/zyl87788408/nexus-agent
 cd nexus-agent
 
 python3 -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 
-python server.py                   # serves on http://127.0.0.1:8085
+python server.py                   # http://127.0.0.1:8085
 ```
-
-You should see Uvicorn start on port **8085**.
-
-### Health check
 
 ```bash
 curl http://127.0.0.1:8085/health
+# {"status":"ok","service":"nexus-agent","version":"2.0.0"}
 ```
 
-```json
-{"status":"ok","service":"nexus-agent"}
+### With a real local model
+
+```bash
+ollama serve &
+ollama pull qwen2.5:0.5b           # or any size your RAM allows
+
+curl -s http://127.0.0.1:8085/api/status | python -m json.tool
 ```
+
+NEXUS detects the model, verifies it responds, and uses it. No configuration needed.
 
 ---
 
-## Testing the OpenAI-compatible endpoint with `curl`
-
-### 1. Non-streaming chat completion
+## Operating modes
 
 ```bash
-curl -s http://127.0.0.1:8085/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "nexus-local",
-    "messages": [
-      {"role": "system", "content": "You are a concise assistant."},
-      {"role": "user", "content": "Explain what NEXUS Agent is in one sentence."}
-    ]
-  }'
+# inspect
+curl http://127.0.0.1:8085/api/modes
+
+# switch (optionally persisted to the config file)
+curl -X POST http://127.0.0.1:8085/api/mode \
+  -H 'Content-Type: application/json' \
+  -d '{"mode":"offline","persist":true}'
 ```
 
-Standard OpenAI response:
+| Mode | Local models | Cloud models | Behaviour |
+| --- | --- | --- | --- |
+| `offline` | yes | blocked before any socket opens | Fully air-gapped. |
+| `online` | yes | with `privacy.allow_cloud` | Explicit opt-in required. |
+| `auto` | preferred | only as fallback, with consent | Local-first. |
+
+The mode switch response reports `verified`: whether the new mode was confirmed working
+(for example, offline is verified only when a local model actually answers). It reports
+failure honestly rather than claiming success.
+
+---
+
+## Honest failure
+
+When no model is available, the engine does not pretend the work succeeded:
 
 ```json
 {
-  "id": "chatcmpl-4f1c9a0d2b7e4c8a9b3e5d6f7a8b9c0d",
-  "object": "chat.completion",
-  "created": 1794630370,
-  "model": "simulated_model",
-  "choices": [
-    {
-      "index": 0,
-      "message": {"role": "assistant", "content": "..."},
-      "finish_reason": "stop"
-    }
-  ],
-  "usage": {"prompt_tokens": 24, "completion_tokens": 36, "total_tokens": 60}
+  "status": "failed",
+  "simulated": true,
+  "error": "no model backend available; refusing to fake execution"
 }
 ```
 
-### 2. Streaming (SSE)
+Chat still degrades to a clearly-labelled simulated answer so the API stays usable, and
+every response carries `nexus.simulated`:
 
-```bash
-curl -N http://127.0.0.1:8085/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "nexus-local",
-    "stream": true,
-    "messages": [{"role": "user", "content": "Count to five."}]
-  }'
-```
-
-Each event is a `chat.completion.chunk`, terminated by `data: [DONE]` — exactly what the
-OpenAI streaming protocol specifies.
-
-### 3. List models
-
-```bash
-curl -s http://127.0.0.1:8085/v1/models
+```json
+{"model": "simulated_model", "nexus": {"source": "simulated", "simulated": true}}
 ```
 
 ---
 
-## Using it as an OpenAI backend
+## HTTP API
 
-### Official `openai` Python SDK
+| Endpoint | Method | Purpose |
+| --- | --- | --- |
+| `/health` | GET | Liveness probe. |
+| `/api/status` | GET | Mode, hardware, tools, plugins, memory. |
+| `/api/modes` | GET | Available and current mode. |
+| `/api/mode` | POST | Switch mode, returns verification result. |
+| `/api/task` | POST | Run a goal through the verified execution loop. |
+| `/api/team` | POST | Run specialist agents on a goal. |
+| `/api/tools` | GET | List tools and scopes. |
+| `/api/tool` | POST | Call a tool inside the sandbox. |
+| `/api/memory` | GET/POST | List or add memories. |
+| `/api/memory/search` | GET | Full-text search. |
+| `/api/memory/{id}` | DELETE | Delete a memory. |
+| `/api/plugins` | GET | Plugin status. |
+| `/v1/models` | GET | OpenAI-compatible model list. |
+| `/v1/chat/completions` | POST | OpenAI-compatible chat, with `stream: true`. |
+
+### OpenAI SDK
 
 ```python
 from openai import OpenAI
 
 client = OpenAI(base_url="http://127.0.0.1:8085/v1", api_key="not-needed")
-
-reply = client.chat.completions.create(
+print(client.chat.completions.create(
     model="nexus-local",
     messages=[{"role": "user", "content": "Hello, NEXUS!"}],
-)
-print(reply.choices[0].message.content)
+).choices[0].message.content)
 ```
 
-### LangChain
+### Streaming
 
-```python
-from langchain_openai import ChatOpenAI
-
-llm = ChatOpenAI(
-    model="nexus-local",
-    base_url="http://127.0.0.1:8085/v1",
-    api_key="not-needed",
-)
-print(llm.invoke("Hello, NEXUS!").content)
+```bash
+curl -N http://127.0.0.1:8085/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"nexus-local","stream":true,"messages":[{"role":"user","content":"Count to five."}]}'
 ```
 
-### OpenHands / any OpenAI-compatible host
-
-Set the base URL to `http://127.0.0.1:8085/v1` and any non-empty API key.
-Only `POST /v1/chat/completions` is required for full compatibility.
+Each event is a `chat.completion.chunk`, terminated by `data: [DONE]`.
 
 ---
 
-## Optional: use a real local model
+## Security defaults
 
-NEXUS works without any model. To get real generations, start either backend:
-
-```bash
-# Ollama
-ollama serve
-ollama pull qwen2.5:3b
-
-# or llama.cpp server
-llama-server -m ./models/qwen2.5-3b-instruct-q4_k_m.gguf --port 8080
-```
-
-NEXUS discovers models automatically and picks the largest one that fits within its
-**memory-safety budget** (~30% of available RAM by default). If the chosen backend becomes
-unreachable at runtime, the request transparently degrades to `SimulatedBackend` instead of
-failing.
-
-### Optional API key
+* Binds to `127.0.0.1`. The server refuses to start on a public host without an API key.
+* API key (`NEXUS_API_KEY`) required on all mutating endpoints when configured.
+* CORS is an allow-list, never `*`.
+* Config file written `0600`; secrets are stored as environment-variable names, never values.
+* Tools run inside a filesystem jail; shell execution is off unless explicitly granted.
 
 ```bash
 export NEXUS_API_KEY=your-secret
 python server.py
 ```
 
-When set, callers must send `Authorization: Bearer your-secret`.
-
 ---
 
-## Memory-safety estimation
+## Hardware adaptation
 
-`nexus/models/estimator.py` guesses peak RAM for a model before you load it:
+`nexus/hardware/optimizer.py` derives a model budget from memory that is actually
+available rather than a flat percentage, which on a 4 GB machine previously yielded a
+budget smaller than any real model.
 
-* Prefers the real weight file size when the backend reports it.
-* Otherwise estimates from parameter count × quantization factor
-  (Q4 ≈ 0.65 B/param, FP16 ≈ 2.10 B/param).
-* Adds KV-cache/context overhead plus a 20% safety margin.
+| Box | Profile | Agents | Context |
+| --- | --- | --- | --- |
+| 2 GB | Lite | 1 | small |
+| 4 GB | Lite | 1 | 2048 |
+| 8 GB | Balanced | 2 | medium |
+| 16 GB+ | Performance | 4+ | large |
 
-`ModelSelector` then keeps only candidates whose estimate fits the RAM budget:
-
-```python
-from nexus.models.selector import ModelSelector
-
-result = ModelSelector().select()
-print(result["ram_budget_mb"])
-print([m["name"] for m in result["candidates"]])
-```
-
-> Estimates are approximate, not runtime guarantees.
+GPU/VRAM is used when genuinely present; a machine without a GPU reports `gpu: null`
+rather than inventing capability.
 
 ---
 
 ## Project layout
 
 ```
-server.py                  OpenAI-compatible FastAPI app (port 8085)
-nexus/core/runtime.py      NexusRuntime: backend resolution, chat + task execution
-nexus/core/execution_loop.py   Step-by-step execution with limits
-nexus/planner/planner.py   LLM-driven task decomposition
-nexus/models/              selector, estimator, ollama & llama.cpp backends
-nexus/hardware/            hardware detection and profile optimization
-nexus/adapters/            plugin manifests, permissions, lifecycle
-tests/                     unittest suite (20 tests)
+server.py                       FastAPI app, OpenAI-compatible surface (port 8085)
+nexus/config.py                 Persistent config, mode enum
+nexus/net.py                    Single network egress point; offline enforcement
+nexus/hardware/                 Detection and profile optimisation
+nexus/models/                   Discovery, probing, selection, cloud backend
+nexus/core/runtime.py           Wiring of every subsystem; chat + tasks
+nexus/core/execution_loop.py    Plan, execute, verify, retry, resume
+nexus/core/journal.py           Append-only journal and checkpoints
+nexus/planner/planner.py        Goal decomposition with tolerant JSON parsing
+nexus/tools/                    Sandbox, tool registry, default tools
+nexus/memory/store.py           SQLite long-term memory
+nexus/agents/, nexus/orchestration/   Specialist agents and coordination
+nexus/adapters/                 Plugin loader, manager, permissions, context
+tests/                          198 tests
 ```
 
-## Running the tests
+---
+
+## Tests
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-## Running the task-execution demo
+198 tests covering modes, the offline guarantee, execution verification, retries and
+resume, sandbox escapes, memory search, multi-agent concurrency, plugin isolation, the
+HTTP surface and security.
+
+The offline guarantee is tested with a socket-level spy: in `offline` mode the suite asserts
+that zero non-loopback connections are attempted.
+
+They also pass with the network namespace fully removed:
 
 ```bash
-python nexus/core/runtime.py
+unshare -n python -m unittest discover -s tests
 ```
 
 ---
 
-## Notes & limitations
+## Limitations
 
-* The simulated backend returns a canned planning-style answer. It exists to guarantee the
-  project always boots, **not** to produce useful intelligence.
-* `/v1/completions`, embeddings, and tool/function calling are not implemented — only
-  `chat.completions` is required for OpenAI-compatible hosts.
-* `stream: true` is supported via SSE; token counting in `usage` is a rough character-based
-  approximation.
+* Only `chat.completions` is implemented (no embeddings or `/v1/completions`).
+* `usage` token counts are character-based approximations.
+* Quality depends entirely on the model you point it at; the fallback backend produces
+  canned text and is always labelled as simulated.
+* Memory-safety budgets are estimates, not runtime guarantees.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE).
