@@ -26,7 +26,7 @@ Two design rules drive the whole codebase:
 | **Local model management** | Discovers Ollama / llama.cpp models, probes whether they actually run, and picks the largest that fits the RAM budget. |
 | **Cloud model integration** | Any OpenAI-compatible endpoint, gated by mode and explicit consent. |
 | **Hardware adaptation** | Detects CPU / RAM / GPU / VRAM / disk and derives a model budget and execution profile from what is really available. |
-| **Plugin system** | Manifest validation, real module import in an isolated namespace, permission scopes, lifecycle hooks, fault isolation. |
+| **Plugin system** | Manifest validation, real module import under a per-plugin module name, permission scopes, lifecycle hooks, fault isolation. |
 | **Long-term memory** | SQLite with FTS5 full-text search (LIKE fallback), tags, importance, backup/restore. |
 | **Multi-agent collaboration** | Specialist agents run with bounded concurrency, isolated failures, and conflict detection. |
 | **Tool calling + sandbox** | Filesystem jail, traversal/symlink escape rejection, credential-path denial, dangerous-command deny-list, disabled by default. |
@@ -173,6 +173,10 @@ python server.py
 A plugin is a directory with a `manifest.json` and a Python module. The host imports
 the module and calls `setup(context)`; whatever the plugin registers there is live in the
 running engine.
+
+Plugins are trusted code and run in-process: the manifest's `permissions` gate which
+host services (`tools`, `model`, `memory`, `filesystem`) the plugin can reach through
+`context.services`, not what Python code it may execute. Only install plugins you trust.
 
 ```
 plugins/

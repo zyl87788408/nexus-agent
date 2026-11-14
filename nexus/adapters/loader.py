@@ -4,9 +4,11 @@ A plugin is a directory containing:
     manifest.json   {"name", "version", "host", "permissions": [...]}
     plugin.py       optional; may define setup(context) -> None / shutdown()
 
-Discovery only parses manifests. Loading imports the module in an isolated
-namespace, so a broken plugin yields an error entry instead of an exception
-that could take down the engine.
+Discovery only parses manifests. Loading gives each plugin its own module name
+so imports do not collide, and contains failures: a broken plugin yields an
+error entry instead of an exception that could take down the engine. Plugins
+run in-process and are trusted code; the permission scopes gate the host
+services they can reach, they are not a sandbox.
 """
 
 from __future__ import annotations
