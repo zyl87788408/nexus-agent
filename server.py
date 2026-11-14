@@ -340,7 +340,7 @@ def main() -> int:
         return 2
 
     print(f"NEXUS listening on http://{host}:{port} (mode={config.mode.value}, "
-          f"auth={'on' if REQUIRE_AUTH else 'off'})")
+          f"auth={'on' if API_KEY else 'off'})")
     uvicorn.run(app, host=host, port=port)
     return 0
 
