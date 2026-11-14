@@ -35,9 +35,15 @@ class PlanningTest(unittest.TestCase):
         tasks = coordinator.plan("do something", agents=["researcher"])
         self.assertEqual([t.agent for t in tasks], ["researcher"])
 
-    def test_unknown_agent_is_ignored(self):
+    def test_unknown_agent_is_rejected(self):
+        """It used to be silently dropped, which hid a typo as "work assigned".
+
+        A caller that asks for a specialist which does not exist must be told,
+        not handed a silently shorter team.
+        """
         coordinator = Coordinator(lambda m: "ok")
-        self.assertEqual(coordinator.plan("x", agents=["ghost"]), [])
+        with self.assertRaises(ValueError):
+            coordinator.plan("x", agents=["ghost"])
 
     def test_custom_profiles_are_used(self):
         profiles = {"solo": AgentProfile("solo", "solo", "you are solo")}
@@ -149,3 +155,22 @@ class ConflictTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class UnknownSpecialistTest(unittest.TestCase):
+    """A misspelt specialist must fail loudly, not be quietly dropped."""
+
+    def test_unknown_agent_raises(self):
+        from nexus.orchestration.coordinator import Coordinator
+
+        coordinator = Coordinator(lambda messages: "x")
+        with self.assertRaises(ValueError) as ctx:
+            coordinator.plan("goal", ["researcher", "critic"])
+        self.assertIn("critic", str(ctx.exception))
+
+    def test_known_agents_are_all_planned(self):
+        from nexus.orchestration.coordinator import Coordinator
+
+        coordinator = Coordinator(lambda messages: "x")
+        planned = coordinator.plan("goal", ["researcher", "reviewer"])
+        self.assertEqual([t.agent for t in planned], ["researcher", "reviewer"])

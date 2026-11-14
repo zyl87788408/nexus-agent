@@ -57,15 +57,21 @@ class Coordinator:
 
     # ------------------------------------------------------------- planning
     def plan(self, goal: str, agents: list[str] | None = None) -> list[SubTask]:
-        """Split a goal into one sub-task per specialist (low-resource friendly)."""
+        """Split a goal into one sub-task per specialist (low-resource friendly).
+
+        An unknown specialist is an error, not something to skip: silently
+        dropping it would let a caller believe work was assigned when it was not.
+        """
         chosen = agents or list(self.profiles)
         if not chosen:
             return [SubTask(goal=goal, agent="default")]
-        return [
-            SubTask(goal=goal, agent=agent)
-            for agent in chosen
-            if agent in self.profiles
-        ]
+        unknown = [a for a in chosen if a not in self.profiles]
+        if unknown:
+            raise ValueError(
+                f"unknown specialist(s): {', '.join(sorted(unknown))}; "
+                f"available: {', '.join(sorted(self.profiles))}"
+            )
+        return [SubTask(goal=goal, agent=agent) for agent in chosen]
 
     # ------------------------------------------------------------ execution
     def _run_one(self, task: SubTask) -> SubTask:

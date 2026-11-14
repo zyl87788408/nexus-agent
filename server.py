@@ -181,7 +181,11 @@ def run_team(request: TeamRequest, authorization: str | None = Header(default=No
         return _error(401, "Invalid API key", "authentication_error", "invalid_api_key")
     if not request.goal.strip():
         return _error(400, "'goal' must not be empty")
-    return runtime.run_team(request.goal, request.agents)
+    try:
+        return runtime.run_team(request.goal, request.agents)
+    except ValueError as exc:
+        # e.g. an unknown specialist name
+        return _error(400, str(exc))
 
 
 @app.get("/api/tools")
