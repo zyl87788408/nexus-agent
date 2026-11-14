@@ -192,8 +192,21 @@ class MemoryStore:
         data["metadata"] = json.loads(data.get("metadata") or "{}")
         return data
 
-    @staticmethod
-    def _fts_query(query: str) -> str:
-        # Quote each token so user input cannot inject FTS operators.
-        tokens = [t for t in query.replace('"', " ").split() if t]
-        return " OR ".join(f'"{t}"' for t in tokens) or '""'
+    # FTS5 keywords that must never reach the MATCH expression as operators.
+    _FTS_KEYWORDS = {"and", "or", "not", "near"}
+
+    @classmethod
+    def _fts_query(cls, query: str) -> str:
+        """Build a quoted OR-query, dropping FTS operators and punctuation.
+
+        Each surviving token is wrapped in double quotes so user input can only
+        ever be matched as a literal, never interpreted as an expression.
+        """
+        cleaned = []
+        for raw in query.replace('"', " ").split():
+            token = "".join(ch for ch in raw if ch.isalnum() or ch in "_-.")
+            # Single characters come from punctuation fragments (e.g. NEAR("a" "b"))
+            # and carry no retrieval signal on their own.
+            if len(token) > 1 and token.lower() not in cls._FTS_KEYWORDS:
+                cleaned.append(token)
+        return " OR ".join(f'"{t}"' for t in cleaned)

@@ -25,13 +25,12 @@ def _classify(result: dict) -> str:
     if result.get("error"):
         return STEP_RETRY if result.get("retryable", True) else STEP_FAILED
     output = result.get("output")
-    verified = result.get("verified")
     has_output = output is not None and str(output).strip() != ""
-    # Untrusted self-report: `done` alone never completes a task.
-    if result.get("done") and (verified or has_output):
+    # Evidence is required, always. A self-declared `verified: True` with no
+    # output is exactly the unverifiable claim this gate exists to reject.
+    if result.get("done") and has_output:
         return STEP_OK
-    if result.get("done") and not has_output and not verified:
-        # The executor claims completion but produced no evidence.
+    if result.get("done") and not has_output:
         return STEP_FAILED
     return STEP_OK if has_output else STEP_FAILED
 
@@ -74,7 +73,7 @@ def run_task(
 
     try:
         if not steps:
-            steps = planner.create_plan(task.goal) if planner else [task.goal]
+            steps = _plan_with_retry(task, planner, retries_allowed, journal)
             if journal:
                 journal.record("plan", steps=steps, source="planner" if planner else "single")
             if checkpoint is not None:
@@ -159,6 +158,29 @@ def run_task(
             "error": str(exc),
             "error_type": type(exc).__name__,
         }
+
+
+def _plan_with_retry(task, planner, max_retries, journal) -> list[str]:
+    """Plan with the same retry budget as steps.
+
+    A transient backend hiccup during planning should not abort the task, and a
+    permanently invalid plan must still surface as a failure rather than being
+    replaced by a silent one-step fallback.
+    """
+    if planner is None:
+        return [task.goal]
+    last_error = None
+    for attempt in range(1, max_retries + 2):
+        try:
+            return planner.create_plan(task.goal)
+        except Exception as exc:
+            last_error = exc
+            if journal:
+                journal.record("plan_error", attempt=attempt,
+                               error=str(exc), error_type=type(exc).__name__)
+            if attempt > max_retries:
+                break
+    raise last_error if last_error else RuntimeError("planning failed")
 
 
 def _run_step(task, step, index, execute_step, verify, max_retries, journal) -> dict:

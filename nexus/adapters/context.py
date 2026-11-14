@@ -2,7 +2,9 @@ class PluginContext:
     def __init__(self, plugin_name, permission_manager, services=None):
         self.plugin_name = plugin_name
         self.permissions = permission_manager
-        self.services = services or {}
+        # Preserve the caller's mapping even when empty: plugins register into
+        # it and expect the host to see those entries.
+        self.services = services if services is not None else {}
 
     def require(self, permission):
         if not self.permissions.check(self.plugin_name, permission):
