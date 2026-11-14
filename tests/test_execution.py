@@ -258,3 +258,36 @@ class JournalTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class EvidenceGateTest(unittest.TestCase):
+    """The gate must hold without an operator-supplied verifier.
+
+    `run_task` accepts `verify=None`. When the verifier was the only thing that
+    rejected an echo, "evidence is mandatory" was enforced solely by the caller:
+    executing a step returned the instruction verbatim was recorded as completed.
+    """
+
+    class Planner:
+        def __init__(self, steps):
+            self.steps = steps
+
+        def create_plan(self, goal):
+            return self.steps
+
+    def test_output_that_echoes_the_step_is_not_evidence(self):
+        result = run_task(
+            Task(goal="g"),
+            lambda step, index: {"output": step, "done": True},
+            planner=self.Planner(["summarise the repo"]),
+        )
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("verifiable", result["error"])
+
+    def test_real_output_still_completes(self):
+        result = run_task(
+            Task(goal="g"),
+            lambda step, index: {"output": "the repo has 12 modules", "done": True},
+            planner=self.Planner(["summarise the repo"]),
+        )
+        self.assertEqual(result["status"], "completed")

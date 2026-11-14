@@ -18,7 +18,13 @@ STEP_RETRY = "retry"        # transient failure, worth another attempt
 STEP_FAILED = "failed"      # permanent failure for this step
 
 
-def _classify(result: dict) -> str:
+def _is_echo(result: dict, step: str) -> bool:
+    """True when the "output" is just the instruction read back."""
+    output = str(result.get("output") or "").strip()
+    return bool(output) and output == str(step).strip()
+
+
+def _classify(result: dict, step: str = "") -> str:
     """Decide whether a step result may advance the task."""
     if not isinstance(result, dict):
         return STEP_FAILED
@@ -29,10 +35,15 @@ def _classify(result: dict) -> str:
     # Evidence is required, always. A self-declared `verified: True` with no
     # output is exactly the unverifiable claim this gate exists to reject.
     if result.get("done") and has_output:
-        return STEP_OK
+        return STEP_FAILED if _is_echo(result, step) else STEP_OK
     if result.get("done") and not has_output:
         return STEP_FAILED
-    return STEP_OK if has_output else STEP_FAILED
+    if not has_output:
+        return STEP_FAILED
+    # An echo is not evidence either, whether or not the caller supplied an
+    # independent verifier; relying on the verifier to notice made this
+    # guarantee optional.
+    return STEP_FAILED if _is_echo(result, step) else STEP_OK
 
 
 def run_task(
@@ -203,7 +214,7 @@ def _run_step(task, step, index, execute_step, verify, max_retries, journal) -> 
                 continue
             return {"status": "failed", "error": last_error, "attempts": attempts}
 
-        verdict = _classify(result)
+        verdict = _classify(result, step)
         if verdict == STEP_OK and verify is not None:
             try:
                 ok, reason = verify(step, result)
