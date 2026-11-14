@@ -33,21 +33,45 @@ class CloudBackend:
             headers["Authorization"] = f"Bearer {self.api_key}"
         return headers
 
-    def chat(self, messages: list[dict]) -> str:
+    def _require_key(self) -> None:
         if not self.api_key:
             raise NetworkError(
                 "cloud API key missing: set the environment variable named by "
                 "cloud.api_key_env (default NEXUS_CLOUD_API_KEY)"
             )
+
+    def chat(self, messages: list[dict], tools=None) -> str:
+        self._require_key()
+        payload = {"model": self.model, "messages": messages, "stream": False}
+        if tools:
+            payload["tools"] = tools
         data = request(
             self.endpoint,
-            payload={"model": self.model, "messages": messages, "stream": False},
+            payload=payload,
             headers=self._headers(),
             timeout=self.timeout,
             policy=self.policy,
         )
         try:
             return data["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise NetworkError(f"malformed cloud response: {exc}") from exc
+
+    def chat_full(self, messages: list[dict], tools=None) -> dict:
+        """Return the full assistant message, including `tool_calls`."""
+        self._require_key()
+        payload = {"model": self.model, "messages": messages, "stream": False}
+        if tools:
+            payload["tools"] = tools
+        data = request(
+            self.endpoint,
+            payload=payload,
+            headers=self._headers(),
+            timeout=self.timeout,
+            policy=self.policy,
+        )
+        try:
+            return data["choices"][0]["message"]
         except (KeyError, IndexError, TypeError) as exc:
             raise NetworkError(f"malformed cloud response: {exc}") from exc
 

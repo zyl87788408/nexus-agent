@@ -58,6 +58,15 @@ These were each violated at some point and fixed; keep them fixed.
 * **Rejected manifests are reported, not dropped.** Discovery returns skip reasons keyed
   by directory; duplicate plugin names are rejects too. Silent absence made a typo look
   like an empty plugin directory.
+* **NEXUS is a model-plane proxy, not an agent engine.** It replaces the *model API*
+  that a host engine (OpenHands etc.) calls. Planning, tool execution and the agent loop
+  belong to the host. Never describe NEXUS as an engine, and never move host logic into it.
+* **`tool_calls` must pass through intact.** A host does all its work by receiving
+  `tool_calls`, executing them, and calling again. The request model needs `tools`, the
+  backend must return the full message (not just `content`), and the response must use
+  OpenAI's shape: `id`, `type: "function"`, `arguments` as a **JSON string**.
+  Dropping any of these silently downgrades every agent turn to plain chat while
+  `finish_reason` still says "stop" — a failure the host cannot detect.
 * **"Disabled" must mean it cannot act.** `PluginManager.disable()` removes the plugin's
   tools from the registry and revokes its grants; it does not just flip a flag. Anything
   that only hides a plugin from `/api/plugins` while leaving it callable is wrong.

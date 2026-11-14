@@ -25,13 +25,33 @@ class OllamaBackend:
         })
         return data["response"]
 
-    def chat(self, messages):
-        data = self._post("/api/chat", {
+    def chat(self, messages, tools=None):
+        payload = {
             "model": self.model,
             "messages": messages,
             "stream": False,
-        })
+        }
+        if tools:
+            payload["tools"] = tools
+        data = self._post("/api/chat", payload)
         return data["message"]["content"]
+
+    def chat_full(self, messages, tools=None):
+        """Like chat() but returns the whole message.
+
+        `chat()` drops `message.tool_calls` on the floor. Ollama does emit them
+        when `tools` are supplied, and a host engine drives its whole loop off
+        those calls, so the passthrough must not discard them.
+        """
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "stream": False,
+        }
+        if tools:
+            payload["tools"] = tools
+        data = self._post("/api/chat", payload)
+        return data.get("message") or {"role": "assistant", "content": ""}
 
     def _post(self, path, payload):
         return request(

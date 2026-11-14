@@ -74,6 +74,17 @@ class SimulatedBackend(ModelBackend):
         )
 
 
+def _call_chat(backend, payload, tools):
+    """Call `backend.chat`, passing `tools` only if it accepts them."""
+    if tools:
+        try:
+            return backend.chat(payload, tools=tools)
+        except TypeError as exc:
+            if "tools" not in str(exc):
+                raise
+    return backend.chat(payload)
+
+
 def _content_text(message: dict) -> str:
     content = message.get("content")
     if isinstance(content, str):
@@ -298,6 +309,60 @@ class NexusRuntime:
         """Handle one conversation. Returns (text, model) - the v1 contract."""
         text, model, _source = self.chat_detail(messages, use_memory=use_memory)
         return text, model
+
+    def chat_message(self, messages: list[dict], *, tools=None,
+                     use_memory: bool = True):
+        """Return the assistant message dict, including `tool_calls` if any.
+
+        `chat_detail()` returns only text, which is enough for a plain chatbot
+        but not for a host engine: OpenHands and similar hosts do all their work
+        by receiving `tool_calls`, executing them, and feeding results back. A
+        proxy that strips `tool_calls` makes the host look broken while the
+        model behaved correctly.
+        """
+        target_model, simulated = self._resolve_backend()
+        self._active_model = target_model
+
+        backend = self.gateway.backend
+        if simulated:
+            fallback = backend if isinstance(backend, SimulatedBackend) \
+                else self._simulated_backend()
+            text = fallback.chat(messages)
+            return {"role": "assistant", "content": text}, "simulated_model", "simulated"
+
+        payload = list(messages)
+        if use_memory:
+            query = _last_user_content(messages)
+            context = self.memory.context_for(query, limit=3) if query else ""
+            if context:
+                payload = [{"role": "system", "content": context}] + payload
+
+        # `tools` must reach the backend verbatim; it is the host's contract.
+        try:
+            if hasattr(backend, "chat_full"):
+                message = backend.chat_full(payload, tools=tools)
+            elif hasattr(backend, "chat"):
+                # Third-party backends may predate `tools`; do not break them by
+                # passing a keyword they never declared.
+                message = {"role": "assistant",
+                           "content": _call_chat(backend, payload, tools)}
+            else:
+                message = {"role": "assistant", "content": backend.generate(_build_prompt(payload))}
+        except CloudBlockedError:
+            self._simulated_backend()
+            self._active_source = "simulated"
+            raise
+        except Exception as exc:
+            if type(exc).__name__ not in NETWORK_ERRORS:
+                raise
+            print(f"⚠️   backend {target_model} unavailable ({exc}); using simulation")
+            text = self._simulated_backend().chat(messages)
+            self._active_model = "simulated_model"
+            return ({"role": "assistant", "content": text},
+                    "simulated_model", "simulated")
+
+        self._active_source = "cloud" if isinstance(backend, CloudBackend) else "local"
+        return message, target_model, self._active_source
 
     def chat_detail(self, messages: list[dict], *, use_memory: bool = True):
         """Like chat() but also reports which source answered.

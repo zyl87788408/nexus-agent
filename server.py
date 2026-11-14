@@ -64,6 +64,11 @@ class ChatCompletionRequest(BaseModel):
     stream: bool = False
     stop: str | list | None = None
     n: int = 1
+    # Tool calling is the contract a host engine actually uses: it sends its
+    # tool schemas, expects `tool_calls` back, runs them, and asks again.
+    # Dropping these fields silently turns every agent turn into plain chat.
+    tools: list[dict] | None = None
+    tool_choice: str | dict | None = None
 
 
 class ModeRequest(BaseModel):
@@ -248,6 +253,31 @@ def plugins():
     return runtime.plugins.status()
 
 
+def _normalise_tool_calls(raw) -> list[dict]:
+    """Map backend tool_calls onto the OpenAI wire format.
+
+    Ollama returns `{"function": {"name", "arguments": {...}}}` with no `id`;
+    OpenAI sends `{"id", "type": "function", "function": {"name",
+    "arguments": "<json string>"}}`. Callers key their tool results off `id`
+    and parse `arguments` as a JSON string, so both gaps must be closed.
+    """
+    if not raw:
+        return []
+    normalised = []
+    for index, call in enumerate(raw):
+        fn = call.get("function") or {}
+        args = fn.get("arguments")
+        if not isinstance(args, str):
+            args = json.dumps(args or {}, ensure_ascii=False)
+        normalised.append({
+            "id": call.get("id") or f"call_{uuid.uuid4().hex[:24]}",
+            "type": "function",
+            "function": {"name": fn.get("name") or "",
+                         "arguments": args},
+        })
+    return normalised
+
+
 class PluginStateRequest(BaseModel):
     enabled: bool
 
@@ -306,7 +336,9 @@ def chat_completions(request: ChatCompletionRequest,
     messages = [m.model_dump(exclude_none=True) for m in request.messages]
 
     try:
-        text, model_used, source = runtime.chat_detail(messages)
+        message, model_used, source = runtime.chat_message(messages, tools=request.tools)
+        text = message.get("content") or ""
+        tool_calls = _normalise_tool_calls(message.get("tool_calls"))
     except CloudBlockedError as exc:
         return _error(403, str(exc), "permission_error", "cloud_blocked")
     except Exception as exc:  # defensive: never leak a stack trace to clients
@@ -325,6 +357,10 @@ def chat_completions(request: ChatCompletionRequest,
 
     prompt_tokens = sum(len(str(m.get("content") or "")) for m in messages) // 4
     completion_tokens = len(text) // 4
+    assistant: dict = {"role": "assistant", "content": text}
+    if tool_calls:
+        assistant["tool_calls"] = tool_calls
+        assistant["content"] = text or None
     return {
         "id": completion_id,
         "object": "chat.completion",
@@ -333,8 +369,8 @@ def chat_completions(request: ChatCompletionRequest,
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": text},
-                "finish_reason": "stop",
+                "message": assistant,
+                "finish_reason": "tool_calls" if tool_calls else "stop",
             }
         ],
         "usage": {

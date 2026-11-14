@@ -1,5 +1,6 @@
 """HTTP surface: OpenAI compatibility, mode switching, tools, memory, auth."""
 
+import json
 import sys
 import tempfile
 import unittest
@@ -314,3 +315,118 @@ class PluginEndpointTest(unittest.TestCase):
                 self.assertIn("demo_tool", registry.names())
             finally:
                 server.runtime.plugins = self.plugins
+
+
+class ToolCallPassthroughTest(unittest.TestCase):
+    """A host engine drives its loop through `tool_calls`.
+
+    NEXUS sits at the model-API layer, so it must forward the host's tool
+    schemas and return OpenAI-shaped `tool_calls`. Before this, `tools` was
+    dropped by the request model and the Ollama backend returned only
+    `message["content"]`, so every agent turn silently degraded to plain chat
+    while `finish_reason` still said "stop" - a failure the host cannot detect.
+    """
+
+    TOOLS = [{
+        "type": "function",
+        "function": {
+            "name": "run_shell",
+            "description": "Execute a shell command",
+            "parameters": {"type": "object",
+                           "properties": {"command": {"type": "string"}},
+                           "required": ["command"]},
+        },
+    }]
+
+    def setUp(self):
+        self.client = TestClient(server.app)
+        self.original_runtime = server.runtime
+
+    def tearDown(self):
+        server.runtime = self.original_runtime
+
+    class _ToolCallingBackend:
+        """Emits an Ollama-shaped tool_calls message, like the real backend."""
+        model = "fake_tool_model"
+
+        def __init__(self):
+            self.seen_tools = None
+
+        def chat(self, messages, tools=None):
+            return ""
+
+        def chat_full(self, messages, tools=None):
+            self.seen_tools = tools
+            return {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "function": {"name": "run_shell",
+                                 "arguments": {"command": "ls"}},
+                }],
+            }
+
+    def _install(self, backend):
+        server.runtime.gateway.set_backend(backend)
+        server.runtime._simulated = None
+        return backend
+
+    def test_tools_reach_the_backend_unchanged(self):
+        backend = self._install(self._ToolCallingBackend())
+        self.client.post("/v1/chat/completions", headers={}, json={
+            "messages": [{"role": "user", "content": "list files"}],
+            "tools": self.TOOLS,
+        })
+        self.assertIsNotNone(backend.seen_tools, "tools were never forwarded")
+        self.assertEqual(backend.seen_tools[0]["function"]["name"], "run_shell")
+
+    def test_response_carries_openai_shaped_tool_calls(self):
+        self._install(self._ToolCallingBackend())
+        body = self.client.post("/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "list files"}],
+            "tools": self.TOOLS,
+        }).json()
+
+        choice = body["choices"][0]
+        self.assertEqual(choice["finish_reason"], "tool_calls")
+        calls = choice["message"]["tool_calls"]
+        self.assertEqual(len(calls), 1)
+        call = calls[0]
+        self.assertEqual(call["type"], "function")
+        self.assertEqual(call["function"]["name"], "run_shell")
+        self.assertIsInstance(call["id"], str)
+        self.assertTrue(call["id"])
+        # OpenAI sends `arguments` as a JSON *string*, not an object.
+        self.assertIsInstance(call["function"]["arguments"], str)
+        self.assertEqual(json.loads(call["function"]["arguments"]),
+                         {"command": "ls"})
+
+    def test_no_tool_calls_still_reports_stop(self):
+        class PlainBackend:
+            model = "plain"
+
+            def chat(self, messages, tools=None):
+                return "just talking"
+
+            def chat_full(self, messages, tools=None):
+                return {"role": "assistant", "content": "just talking"}
+
+        self._install(PlainBackend())
+        body = self.client.post("/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": self.TOOLS,
+        }).json()
+        choice = body["choices"][0]
+        self.assertEqual(choice["finish_reason"], "stop")
+        self.assertNotIn("tool_calls", choice["message"])
+        self.assertEqual(choice["message"]["content"], "just talking")
+
+    def test_missing_tool_call_id_is_synthesised(self):
+        """Ollama omits `id`; hosts key their tool results off it."""
+        self._install(self._ToolCallingBackend())
+        body = self.client.post("/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "list files"}],
+            "tools": self.TOOLS,
+        }).json()
+        call = body["choices"][0]["message"]["tool_calls"][0]
+        self.assertTrue(call["id"].startswith("call_"))

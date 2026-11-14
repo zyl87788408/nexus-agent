@@ -1,10 +1,21 @@
 # NEXUS Agent
 
-> **A local AI agent engine with a drop-in OpenAI-compatible API, verified task execution, and a hard offline guarantee.**
+> **A local model-plane proxy: it takes over an agent engine's model API calls and serves them from your own machine.**
 
-NEXUS Agent runs AI tasks on your own machine. It exposes the OpenAI chat-completions
-protocol, so OpenHands, LangChain, the official `openai` SDK and similar hosts can point at
-it without changes.
+NEXUS does **not** replace OpenHands, LangChain or any other agent engine. The engine stays
+in charge of planning, tool execution and its agent loop. NEXUS is plugged in at the
+*model API layer* — the engine is pointed at NEXUS's base URL instead of a cloud model, and
+NEXUS serves those `POST /v1/chat/completions` calls from a local model.
+
+```
+host engine  --(OpenAI API)-->  NEXUS  --(Ollama / llama.cpp)-->  local model
+```
+
+Because the host drives its loop with tool calls, NEXUS forwards `tools` verbatim and
+returns OpenAI-shaped `tool_calls` (`id`, `type: "function"`, `arguments` as a JSON
+string), so the host's tool loop keeps working unchanged. Verified with the official
+`openai` SDK end to end: request → `tool_calls` → host executes → result sent back →
+final answer.
 
 Two design rules drive the whole codebase:
 
