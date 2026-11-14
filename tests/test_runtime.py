@@ -52,26 +52,41 @@ class SimulatedBackendTest(unittest.TestCase):
 
 
 class RuntimeFallbackTest(unittest.TestCase):
-    def test_no_model_falls_back_to_simulated(self):
+    """No backend means no real work.
+
+    These tests previously asserted `completed` while nothing was executed.
+    That is precisely the false-success path the engine must never take, so
+    the contract is now: fall back to the simulated backend for *chat*, but
+    fail the *task* with an explicit error.
+    """
+
+    def test_no_model_fails_with_explicit_error(self):
         runtime = make_runtime([])
         result = runtime.run_task("测试核心闭环")
-        self.assertEqual(result["status"], "completed")
-        self.assertEqual(result["model"], "simulated_model")
-        self.assertGreaterEqual(result["steps"], 1)
+        self.assertEqual(result["status"], "failed")
+        self.assertTrue(result["simulated"])
+        self.assertIn("refusing to fake execution", result["error"])
         self.assertIsInstance(runtime.gateway.backend, SimulatedBackend)
 
-    def test_unreachable_backend_falls_back_to_simulated(self):
+    def test_unreachable_backend_fails_and_names_the_model(self):
         runtime = make_runtime([{"backend": "ollama", "name": "qwen2.5:3b"}])
-        result = runtime.run_task("后端不可达时应回落模拟")
-        self.assertEqual(result["status"], "completed")
-        self.assertEqual(result["model"], "simulated_model")
-        self.assertIsInstance(runtime.gateway.backend, SimulatedBackend)
+        result = runtime.run_task("后端不可达时应如实失败")
+        self.assertEqual(result["status"], "failed")
+        # Report the backend that actually failed, not a simulated stand-in.
+        self.assertEqual(result["model"], "qwen2.5:3b")
+        self.assertTrue(result["error"])
+
+    def test_unreachable_backend_still_answers_chat(self):
+        # Chat keeps the helpful simulated fallback; only tasks refuse to fake.
+        runtime = make_runtime([{"backend": "ollama", "name": "qwen2.5:3b"}])
+        text, model = runtime.chat([{"role": "user", "content": "hi"}])
+        self.assertEqual(model, "simulated_model")
+        self.assertIn("[simulated]", text)
 
     def test_unknown_backend_falls_back_to_simulated(self):
         runtime = make_runtime([{"backend": "mystery", "name": "x-model"}])
         result = runtime.run_task("未知后端")
-        self.assertEqual(result["status"], "completed")
-        self.assertEqual(result["model"], "x-model")
+        self.assertEqual(result["status"], "failed")
         self.assertIsInstance(runtime.gateway.backend, SimulatedBackend)
 
     def test_step_executor_marks_simulated(self):
@@ -91,24 +106,38 @@ class NoFallbackOnLogicErrorTest(unittest.TestCase):
         runtime.gateway.set_backend(BadBackend())
         result = runtime.run_task("计划非法时不应假装成功")
         self.assertEqual(result["status"], "failed")
-        self.assertNotIn("simulated_model", result["model"])
+        # A bad plan is a real failure; it must not be relabelled as a
+        # simulated success. The fake selector reports no candidates, so the
+        # runtime has no verified local model to name.
+        self.assertTrue(result["error"])
+        self.assertNotEqual(result["status"], "completed")
 
 
 class ExecutionLoopTest(unittest.TestCase):
-    def test_stops_at_max_steps(self):
+    def test_stops_at_max_steps_and_fails(self):
         task = Task(goal="无限步骤", max_steps=2)
         result = run_execution_loop(
-            task, lambda s, i: {"done": False}, planner=ManyStepPlanner(5)
+            task, lambda s, i: {"done": False, "output": f"did {s}"},
+            planner=ManyStepPlanner(5)
         )
         self.assertEqual(result["status"], "failed")
         self.assertEqual(task.steps, 2)
         self.assertEqual(task.status, TaskStatus.FAILED)
 
-    def test_done_step_completes_task(self):
+    def test_done_with_output_completes_task(self):
         task = Task(goal="一步完成")
-        result = run_execution_loop(task, lambda s, i: {"done": True})
+        result = run_execution_loop(
+            task, lambda s, i: {"done": True, "output": "real result"}
+        )
         self.assertEqual(result["status"], "completed")
         self.assertEqual(task.status, TaskStatus.COMPLETED)
+
+    def test_done_without_evidence_fails(self):
+        """A bare `done: True` is not proof of work and must not complete."""
+        task = Task(goal="空转一步", max_retries=0)
+        result = run_execution_loop(task, lambda s, i: {"done": True})
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(task.status, TaskStatus.FAILED)
 
 
 if __name__ == "__main__":

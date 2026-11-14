@@ -1,38 +1,51 @@
-"""OpenAI-compatible HTTP server for NEXUS Agent.
+"""OpenAI-compatible HTTP server for NEXUS.
 
-Exposes POST /v1/chat/completions (and /v1/models) so any OpenAI client
-(OpenHands, LangChain, the openai SDK, ...) can use NEXUS as a backend.
-Falls back to SimulatedBackend when no local model is reachable.
+Security defaults:
+  * binds to 127.0.0.1 (never 0.0.0.0) unless explicitly overridden;
+  * requires an API key whenever one is configured, and *refuses to start*
+    on a non-loopback host without one;
+  * CORS is an allow-list, not a wildcard.
 """
+
+from __future__ import annotations
 
 import json
 import os
 import sys
 import time
 import uuid
+from pathlib import Path
 
 from fastapi import FastAPI, Header
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from nexus.core.runtime import NexusRuntime
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-API_KEY = os.environ.get("NEXUS_API_KEY", "")
+from nexus.config import Config, Mode
+from nexus.core.runtime import NexusRuntime
+from nexus.net import CloudBlockedError
+
+config = Config.load()
+runtime = NexusRuntime(config)
+
+API_KEY = config.server_api_key()
 
 app = FastAPI(
     title="NEXUS Agent",
     description="Lightweight local AI engine plugin with an OpenAI-compatible API.",
-    version="1.0.0",
-)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    version="2.0.0",
 )
 
-runtime = NexusRuntime()
+_cors = config.get("server.cors_origins") or []
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
+)
 
 
 class ChatMessage(BaseModel):
@@ -52,18 +65,163 @@ class ChatCompletionRequest(BaseModel):
     n: int = 1
 
 
-def _error(status_code, message, err_type="invalid_request_error", code=None):
-    from fastapi.responses import JSONResponse
+class ModeRequest(BaseModel):
+    mode: str
+    allow_cloud: bool | None = None
+    persist: bool = True
 
+
+class TaskRequest(BaseModel):
+    goal: str
+    resume_task_id: str | None = None
+
+
+class TeamRequest(BaseModel):
+    goal: str
+    agents: list[str] | None = None
+
+
+class MemoryRequest(BaseModel):
+    content: str
+    kind: str = "note"
+    tags: list[str] | None = None
+    importance: float = 0.5
+
+
+class ToolCallRequest(BaseModel):
+    tool: str
+    arguments: dict = {}
+
+
+def _error(status_code: int, message: str, err_type="invalid_request_error",
+           code=None):
     return JSONResponse(
         status_code=status_code,
         content={"error": {"message": message, "type": err_type, "code": code}},
     )
 
 
+def _auth_required() -> bool:
+    """Evaluated per request so a key set after import takes effect."""
+    return bool(API_KEY) or bool(config.get("server.require_auth", False))
+
+
+def _authorized(authorization: str | None) -> bool:
+    if not _auth_required():
+        return True
+    if not authorization:
+        return False
+    token = authorization.replace("Bearer ", "", 1).strip()
+    return bool(API_KEY) and token == API_KEY
+
+
+# ---------------------------------------------------------------- endpoints
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "nexus-agent"}
+    return {"status": "ok", "service": "nexus-agent", "version": "2.0.0"}
+
+
+@app.get("/api/status")
+def status():
+    return runtime.status()
+
+
+@app.get("/api/modes")
+def modes():
+    return {
+        "modes": [m.value for m in Mode],
+        "current": config.mode.value,
+        "cloud_allowed": config.allow_cloud,
+        "cloud_enabled": config.cloud_enabled,
+    }
+
+
+@app.post("/api/mode")
+def set_mode(request: ModeRequest, authorization: str | None = Header(default=None)):
+    if not _authorized(authorization):
+        return _error(401, "Invalid API key", "authentication_error", "invalid_api_key")
+    try:
+        return runtime.set_mode(request.mode, allow_cloud=request.allow_cloud,
+                                persist=request.persist)
+    except ValueError as exc:
+        return _error(400, str(exc))
+
+
+@app.post("/api/task")
+def run_task(request: TaskRequest, authorization: str | None = Header(default=None)):
+    if not _authorized(authorization):
+        return _error(401, "Invalid API key", "authentication_error", "invalid_api_key")
+    if not request.goal.strip():
+        return _error(400, "'goal' must not be empty")
+    return runtime.run_task(request.goal, resume_task_id=request.resume_task_id)
+
+
+@app.post("/api/team")
+def run_team(request: TeamRequest, authorization: str | None = Header(default=None)):
+    if not _authorized(authorization):
+        return _error(401, "Invalid API key", "authentication_error", "invalid_api_key")
+    if not request.goal.strip():
+        return _error(400, "'goal' must not be empty")
+    return runtime.run_team(request.goal, request.agents)
+
+
+@app.get("/api/tools")
+def list_tools():
+    return {"tools": runtime.tools.specs()}
+
+
+@app.post("/api/tool")
+def call_tool(request: ToolCallRequest,
+              authorization: str | None = Header(default=None)):
+    if not _authorized(authorization):
+        return _error(401, "Invalid API key", "authentication_error", "invalid_api_key")
+    result = runtime.tools.call(request.tool, **request.arguments)
+    return result.to_dict()
+
+
+@app.get("/api/memory")
+def memory_recent(limit: int = 20, kind: str | None = None,
+                  authorization: str | None = Header(default=None)):
+    if not _authorized(authorization):
+        return _error(401, "Invalid API key", "authentication_error", "invalid_api_key")
+    return {"memories": runtime.memory.recent(limit, kind),
+            "count": runtime.memory.count()}
+
+
+@app.get("/api/memory/search")
+def memory_search(q: str, limit: int = 10,
+                  authorization: str | None = Header(default=None)):
+    if not _authorized(authorization):
+        return _error(401, "Invalid API key", "authentication_error", "invalid_api_key")
+    return {"query": q, "results": runtime.memory.search(q, limit=limit)}
+
+
+@app.post("/api/memory")
+def memory_add(request: MemoryRequest,
+               authorization: str | None = Header(default=None)):
+    if not _authorized(authorization):
+        return _error(401, "Invalid API key", "authentication_error", "invalid_api_key")
+    try:
+        memory_id = runtime.memory.add(
+            request.content, kind=request.kind, tags=request.tags,
+            importance=request.importance,
+        )
+    except ValueError as exc:
+        return _error(400, str(exc))
+    return {"id": memory_id, "stored": True}
+
+
+@app.delete("/api/memory/{memory_id}")
+def memory_delete(memory_id: str,
+                  authorization: str | None = Header(default=None)):
+    if not _authorized(authorization):
+        return _error(401, "Invalid API key", "authentication_error", "invalid_api_key")
+    return {"deleted": runtime.memory.delete(memory_id)}
+
+
+@app.get("/api/plugins")
+def plugins():
+    return runtime.plugins.status()
 
 
 @app.get("/v1/models")
@@ -71,32 +229,27 @@ def list_models():
     return {
         "object": "list",
         "data": [
-            {
-                "id": "nexus-local",
-                "object": "model",
-                "created": int(time.time()),
-                "owned_by": "nexus",
-            }
+            {"id": "nexus-local", "object": "model",
+             "created": int(time.time()), "owned_by": "nexus"}
         ],
     }
 
 
 @app.post("/v1/chat/completions")
-def chat_completions(
-    request: ChatCompletionRequest,
-    authorization: str | None = Header(default=None),
-):
-    if API_KEY and authorization != f"Bearer {API_KEY}":
+def chat_completions(request: ChatCompletionRequest,
+                     authorization: str | None = Header(default=None)):
+    if not _authorized(authorization):
         return _error(401, "Invalid API key", "authentication_error", "invalid_api_key")
-
     if not request.messages:
         return _error(400, "'messages' must not be empty")
 
     messages = [m.model_dump(exclude_none=True) for m in request.messages]
 
     try:
-        text, model_used = runtime.chat(messages)
-    except Exception as exc:  # pragma: no cover - defensive
+        text, model_used, source = runtime.chat_detail(messages)
+    except CloudBlockedError as exc:
+        return _error(403, str(exc), "permission_error", "cloud_blocked")
+    except Exception as exc:  # defensive: never leak a stack trace to clients
         print(f"[nexus] chat failed: {exc}", file=sys.stderr)
         return _error(500, str(exc), "server_error")
 
@@ -111,7 +264,7 @@ def chat_completions(
         )
 
     prompt_tokens = sum(len(str(m.get("content") or "")) for m in messages) // 4
-
+    completion_tokens = len(text) // 4
     return {
         "id": completion_id,
         "object": "chat.completion",
@@ -126,9 +279,10 @@ def chat_completions(
         ],
         "usage": {
             "prompt_tokens": prompt_tokens,
-            "completion_tokens": len(text) // 4,
-            "total_tokens": prompt_tokens + len(text) // 4,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
         },
+        "nexus": {"source": source, "simulated": source == "simulated"},
     }
 
 
@@ -151,7 +305,26 @@ def _stream_chunks(completion_id, created, model, text):
     yield "data: [DONE]\n\n"
 
 
-if __name__ == "__main__":
+def main() -> int:
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8085)
+    host = config.get("server.host", "127.0.0.1")
+    port = int(config.get("server.port", 8085))
+
+    # Refuse to expose an unauthenticated service on a public interface.
+    if host not in {"127.0.0.1", "localhost", "::1"} and not API_KEY:
+        print(
+            f"ERROR: refusing to bind {host} without NEXUS_API_KEY set.\n"
+            "Set the API key, or bind 127.0.0.1 for local-only use.",
+            file=sys.stderr,
+        )
+        return 2
+
+    print(f"NEXUS listening on http://{host}:{port} (mode={config.mode.value}, "
+          f"auth={'on' if REQUIRE_AUTH else 'off'})")
+    uvicorn.run(app, host=host, port=port)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

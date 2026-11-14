@@ -36,3 +36,11 @@ data/*
 *.bak
 *.orig
 *.rej
+
+# Runtime state (never commit user data, databases or sandbox files)
+plugins/
+*.db
+*.db-journal
+*.jsonl
+data/*
+!data/.gitkeep

@@ -2,21 +2,53 @@ import json
 import sys
 from pathlib import Path
 
-# 允许 `python nexus/core/runtime.py` 直接运行（脚本模式下项目根不在 sys.path 中）
+# Allow `python nexus/core/runtime.py` (script mode puts no project root on sys.path)
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from nexus.adapters.manager import PluginManager
+from nexus.config import Config, Mode
 from nexus.core.execution_loop import run_task as run_execution_loop
+from nexus.core.journal import Checkpoint, Journal
 from nexus.core.lifecycle import Task
+from nexus.memory.store import MemoryStore
+from nexus.models.cloud import CloudBackend
 from nexus.models.gateway import ModelBackend, ModelGateway
 from nexus.models.llamacpp import LlamaCppBackend
 from nexus.models.ollama import OllamaBackend
 from nexus.models.selector import ModelSelector
+from nexus.net import CloudBlockedError
+from nexus.net import NetworkPolicy
+from nexus.orchestration.coordinator import Coordinator
 from nexus.planner.planner import Planner
+from nexus.tools.registry import build_default_registry
+from nexus.tools.sandbox import Sandbox
+
+BACKENDS = {
+    "ollama": OllamaBackend,
+    "llama.cpp": LlamaCppBackend,
+    "cloud": CloudBackend,
+}
+
+# Fall back only on transport errors, never on logic errors such as a bad plan.
+NETWORK_ERRORS = (
+    "NetworkError",
+    "URLError",
+    "HTTPError",
+    "ConnectionError",
+    "TimeoutError",
+    "OSError",
+)
 
 
 class SimulatedBackend(ModelBackend):
-    """离线兜底后端：没有本地模型时也能跑通「规划 + 执行」闭环。"""
+    """Last-resort backend so the engine always boots.
+
+    It is explicitly labelled: callers can see `simulated=True` and must never
+    treat its output as real model capability.
+    """
+
+    model = "simulated_model"
 
     def generate(self, prompt: str) -> str:
         goal = prompt.rsplit("Goal:", 1)[-1].strip() or "unknown task"
@@ -34,17 +66,14 @@ class SimulatedBackend(ModelBackend):
     def chat(self, messages: list[dict]) -> str:
         user_text = _last_user_content(messages)
         return (
-            "[simulated] NEXUS 当前未检测到可用的本地模型，正在以模拟模式应答。\n"
+            "[simulated] NEXUS 未检测到可用的推理后端。\n"
             f"收到的问题：{user_text}\n"
-            "模拟执行计划：\n"
-            "1. 分析任务目标\n"
-            "2. 拆解为可执行子步骤\n"
-            "3. 汇总执行结果并输出结论\n"
-            "配置 Ollama 或 llama.cpp 后可获得真实模型输出。"
+            "这是兜底回答，不是模型推理结果。\n"
+            "请启动 Ollama/llama.cpp，或在配置中启用云端供应商。"
         )
 
 
-def _content_text(message):
+def _content_text(message: dict) -> str:
     content = message.get("content")
     if isinstance(content, str):
         return content
@@ -57,133 +86,369 @@ def _content_text(message):
     return ""
 
 
-def _last_user_content(messages):
+def _last_user_content(messages: list[dict]) -> str:
     for message in reversed(messages):
         if message.get("role") == "user":
             return _content_text(message)
     return ""
 
 
-def _build_prompt(messages):
+def _build_prompt(messages: list[dict]) -> str:
     return "\n".join(
-        f"{message.get('role', 'user')}: {_content_text(message)}"
-        for message in messages
+        f"{m.get('role', 'user')}: {_content_text(m)}" for m in messages
     )
 
 
-BACKENDS = {
-    "ollama": OllamaBackend,
-    "llama.cpp": LlamaCppBackend,
-}
-
-# 仅在这类错误上回落模拟模式，避免把「计划非法」等真实缺陷掩盖成成功
-NETWORK_ERRORS = {"URLError", "HTTPError", "ConnectionError", "TimeoutError", "OSError"}
-
-
 class NexusRuntime:
-    def __init__(self):
+    """Wires configuration, models, tools, memory, plugins and agents together."""
+
+    def __init__(self, config: Config | None = None):
+        self.config = config or Config.load()
         self.selector = ModelSelector()
         self.gateway = ModelGateway()
         self.planner = Planner(self.gateway)
         self._simulated = None
+        self._active_model = None
+        self._active_source = None
 
-    def run_task(self, task_goal):
-        print(f"🚀 [NEXUS] 接收到任务目标: {task_goal}")
+        self.policy = self._build_policy()
 
-        # 1. 发现并选择本地模型
-        target_model, simulated = self._resolve_backend()
+        self.tools = build_default_registry(
+            Sandbox(self.config.resolve_path("data/sandbox"))
+        )
+        if self.config.get("tools.allow_shell"):
+            self.tools.grant("shell")
+            self.tools.sandbox.allow_shell = True
 
-        # 2 + 3. 规划器拆解任务，执行引擎逐步执行（create_plan 由执行循环调用）
-        print("🧠 [Planner] 正在拆解任务...")
-        print("⚙️ [Runtime] 开始执行计划...")
-        result = run_execution_loop(
-            Task(goal=task_goal),
-            self._step_executor(lambda: simulated),
-            planner=self.planner,
+        self.memory = MemoryStore(
+            self.config.resolve_path(self.config.get("memory.db_path", "data/memory.db"))
         )
 
-        # 本地后端不可达时，回落到模拟模型重跑一遍，保证闭环不中断
-        if result.get("error_type") in NETWORK_ERRORS and not simulated:
-            print(f"⚠️ 警告: 模型 {target_model} 不可用（{result.get('error')}），回退模拟模式。")
-            self._simulated_backend()
-            simulated = True
-            target_model = "simulated_model"
-            result = run_execution_loop(
-                Task(goal=task_goal),
-                self._step_executor(lambda: simulated),
-                planner=self.planner,
-            )
+        checkpoint_dir = self.config.resolve_path(
+            self.config.get("execution.checkpoint_dir", "data/checkpoints")
+        )
+        self.checkpoint = Checkpoint(checkpoint_dir)
+        self.journal_dir = checkpoint_dir
 
-        result["model"] = target_model
+        self.plugins = PluginManager(
+            self.config.resolve_path("plugins"),
+            services={"memory": self.memory, "tools": self.tools, "runtime": self},
+        )
 
-        if result.get("status") == "completed":
-            print(
-                f"🎉 [NEXUS] 任务执行完成！共执行 {result.get('steps', 0)} 个步骤"
-                f"（模型: {target_model}）"
-            )
-        else:
-            print(f"❌ [NEXUS] 任务未完成: {result.get('error') or result.get('status')}")
+    # ----------------------------------------------------------------- policy
+    def _build_policy(self) -> NetworkPolicy:
+        return NetworkPolicy(self.config.mode, self.config.allow_cloud)
 
-        return result
+    def refresh_policy(self) -> NetworkPolicy:
+        self.policy = self._build_policy()
+        return self.policy
 
-    def chat(self, messages):
-        """按 OpenAI 对话格式处理一次请求，返回 (文本, 模型名)。"""
-        target_model, simulated = self._resolve_backend()
+    # ----------------------------------------------------------------- status
+    def status(self) -> dict:
+        return {
+            "mode": self.config.mode.value,
+            "active_model": self._active_model,
+            "active_source": self._active_source,
+            "cloud_allowed": self.config.allow_cloud,
+            "cloud_enabled": self.config.cloud_enabled,
+            "tools": self.tools.names(),
+            "plugins": self.plugins.status(),
+            "memory_entries": self.memory.count(),
+            "simulated": isinstance(self.gateway.backend, SimulatedBackend),
+        }
+
+    # ----------------------------------------------------------------- models
+    def set_mode(self, mode, *, allow_cloud: bool | None = None,
+                 persist: bool = True) -> dict:
+        """Switch mode, then prove the new setting actually works."""
+        self.config.mode = Mode.parse(mode)
+        if allow_cloud is not None:
+            self.config.allow_cloud = allow_cloud
+        self.refresh_policy()
+        if persist:
+            self.config.save()
+        verification = self.verify_connection()
+        return {
+            "mode": self.config.mode.value,
+            "verified": verification.get("ok", False),
+            "detail": verification,
+        }
+
+    def verify_connection(self) -> dict:
+        """Prove the configured backend is reachable before claiming success."""
+        mode = self.config.mode
+        if mode is Mode.OFFLINE:
+            candidates = self._select(probe=True)["candidates"]
+            if candidates:
+                return {"ok": True, "source": "local", "model": candidates[0]["name"]}
+            return {"ok": False, "source": "local",
+                    "error": "no usable local model (offline mode)"}
+
+        if mode is Mode.ONLINE:
+            if not self.config.cloud_enabled:
+                return {"ok": False, "source": "cloud",
+                        "error": "cloud provider is not enabled in config"}
+            if not self.config.cloud_api_key():
+                return {"ok": False, "source": "cloud",
+                        "error": "cloud API key environment variable is empty"}
+            backend = self._cloud_backend()
+            if backend is None:
+                return {"ok": False, "source": "cloud",
+                        "error": "cloud access is not authorized"}
+            result = backend.probe()
+            return {"ok": bool(result.get("available")), "source": "cloud",
+                    "detail": result}
+
+        # AUTO: prefer local; reach for cloud only when explicitly authorized.
+        local = self._select(probe=True)["candidates"]
+        if local:
+            return {"ok": True, "source": "local", "model": local[0]["name"]}
+        if self.config.cloud_enabled and self.config.allow_cloud:
+            backend = self._cloud_backend()
+            if backend is not None:
+                result = backend.probe()
+                return {"ok": bool(result.get("available")), "source": "cloud",
+                        "detail": result}
+        return {"ok": False, "source": "none",
+                "error": "no local model and cloud is not authorized"}
+
+    def _cloud_backend(self):
+        if not self.config.allow_cloud:
+            return None
+        return CloudBackend(
+            model=self.config.get("cloud.model"),
+            base_url=self.config.get("cloud.base_url"),
+            api_key=self.config.cloud_api_key(),
+            policy=self.policy,
+        )
+
+    def _select(self, *, probe: bool = False) -> dict:
+        """Call the selector while tolerating injected selectors without `probe`."""
+        try:
+            return self.selector.select(probe=probe)
+        except TypeError:
+            return self.selector.select()
+
+    def _resolve_backend(self, *, probe: bool = False):
+        """Choose a backend while honouring the offline guarantee."""
         backend = self.gateway.backend
+        if backend is not None and backend is not self._simulated:
+            return getattr(backend, "model", None) or "injected_model", False
 
-        if not simulated and hasattr(backend, "chat"):
-            try:
-                return backend.chat(messages), target_model
-            except Exception as exc:
-                if type(exc).__name__ not in NETWORK_ERRORS:
-                    raise
-                print(f"⚠️ 警告: 模型 {target_model} 不可用（{exc}），回退模拟模式。")
+        mode = self.config.mode
+        if mode is not Mode.ONLINE:
+            selection = self._select(probe=probe)
+            candidates = selection.get("candidates") or []
+            if candidates:
+                model = candidates[0]
+                backend_cls = BACKENDS.get(model.get("backend"))
+                if backend_cls is not None:
+                    self._simulated = None
+                    self.gateway.set_backend(backend_cls(model["name"]))
+                    self._active_source = "local"
+                    return model["name"], False
+            if mode is Mode.OFFLINE:
+                # Never silently escalate to the cloud while offline.
+                self._simulated_backend()
+                self._active_source = "simulated"
+                return "simulated_model", True
 
-        return self._simulated_backend().chat(messages), "simulated_model"
+        if self.config.cloud_enabled and self.config.allow_cloud:
+            cloud = self._cloud_backend()
+            if cloud is not None:
+                self._simulated = None
+                self.gateway.set_backend(cloud)
+                self._active_source = "cloud"
+                return cloud.model, False
+
+        self._simulated_backend()
+        self._active_source = "simulated"
+        return "simulated_model", True
 
     def _simulated_backend(self):
         self._simulated = SimulatedBackend()
         self.gateway.set_backend(self._simulated)
         return self._simulated
 
-    def _resolve_backend(self):
+    # ------------------------------------------------------------------- chat
+    def chat(self, messages: list[dict], *, use_memory: bool = True):
+        """Handle one conversation. Returns (text, model) - the v1 contract."""
+        text, model, _source = self.chat_detail(messages, use_memory=use_memory)
+        return text, model
+
+    def chat_detail(self, messages: list[dict], *, use_memory: bool = True):
+        """Like chat() but also reports which source answered.
+
+        Returns (text, model, source) where source is
+        "local" | "cloud" | "simulated".
+        """
+        target_model, simulated = self._resolve_backend()
+        self._active_model = target_model
+
+        if simulated:
+            return self._simulated_backend().chat(messages), "simulated_model", "simulated"
+
         backend = self.gateway.backend
-        # 外部注入的后端优先；只有本次兜底装的模拟后端才需要重新探测，
-        # 这样模型上线后能自动恢复，同时不覆盖调用方自己注入的后端。
-        if backend is not None and backend is not self._simulated:
-            return getattr(backend, "model", None) or "injected_model", False
+        payload = list(messages)
+        if use_memory:
+            query = _last_user_content(messages)
+            context = self.memory.context_for(query, limit=3) if query else ""
+            if context:
+                payload = [{"role": "system", "content": context}] + payload
 
-        candidates = self.selector.select().get("candidates") or []
-        if not candidates:
-            print("⚠️ 警告: 未发现可用本地模型。将使用模拟模式或 API 兜底。")
+        try:
+            if hasattr(backend, "chat"):
+                text = backend.chat(payload)
+            else:
+                text = backend.generate(_build_prompt(payload))
+        except CloudBlockedError:
+            # Policy violations are surfaced, never downgraded to a fake answer.
             self._simulated_backend()
-            return "simulated_model", True
+            self._active_source = "simulated"
+            raise
+        except Exception as exc:
+            if type(exc).__name__ not in NETWORK_ERRORS:
+                raise
+            print(f"⚠️  backend {target_model} unavailable ({exc}); using simulation")
+            text = self._simulated_backend().chat(messages)
+            self._active_model = "simulated_model"
+            return text, "simulated_model", "simulated"
 
-        model = candidates[0]
-        target_model = model["name"]
-        backend_cls = BACKENDS.get(model.get("backend"))
-        if backend_cls is None:
-            print(f"⚠️ 警告: 后端 {model.get('backend')!r} 未实现，回退模拟模式。")
-            self._simulated_backend()
-            return target_model, True
+        self._active_source = "cloud" if isinstance(backend, CloudBackend) else "local"
+        return text, target_model, self._active_source
 
-        self._simulated = None
-        self.gateway.set_backend(backend_cls(target_model))
-        print(f"✅ 选定模型: {target_model}")
-        return target_model, False
-
+    # ------------------------------------------------------------------ tasks
     def _step_executor(self, get_simulated):
-        def execute_step(step, index):
-            simulated = get_simulated()
-            label = "模拟执行" if simulated else "执行"
-            print(f"   ↳ [{label}] 步骤 {index}: {step}")
-            return {"step": index, "goal": step, "simulated": simulated, "done": False}
+        """Execute one plan step for real: ask the model, then verify the answer."""
+
+        def execute_step(step: str, index: int) -> dict:
+            if get_simulated():
+                # Refuse to fabricate execution when there is no backend.
+                return {
+                    "step": index,
+                    "goal": step,
+                    "simulated": True,
+                    "done": False,
+                    "output": "",
+                    "error": "no model backend available; refusing to fake execution",
+                    "retryable": False,
+                }
+            backend = self.gateway.backend
+            prompt = [
+                {
+                    "role": "system",
+                    "content": "执行下面这一步，输出可直接使用的具体结果，不要复述计划。",
+                },
+                {"role": "user", "content": step},
+            ]
+            try:
+                if hasattr(backend, "chat"):
+                    output = backend.chat(prompt)
+                else:
+                    output = backend.generate(_build_prompt(prompt))
+            except Exception as exc:
+                return {
+                    "step": index,
+                    "goal": step,
+                    "done": False,
+                    "output": "",
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "retryable": type(exc).__name__ in NETWORK_ERRORS,
+                }
+            text = (output or "").strip()
+            return {
+                "step": index,
+                "goal": step,
+                "simulated": False,
+                "done": False,
+                "output": text,
+                "error": "" if text else "model returned an empty result",
+                "retryable": True,
+            }
 
         return execute_step
 
+    @staticmethod
+    def _verify_step(step: str, result: dict) -> tuple[bool, str]:
+        """Independent check that a step produced usable, non-faked output."""
+        output = str(result.get("output") or "").strip()
+        if not output:
+            return False, "empty output"
+        if result.get("simulated"):
+            return False, "simulated steps are never accepted as real work"
+        if output == str(step).strip():
+            return False, "output only repeats the instruction"
+        return True, ""
+
+    def run_task(self, task_goal: str, *, resume_task_id: str | None = None) -> dict:
+        target_model, simulated = self._resolve_backend(probe=True)
+        self._active_model = target_model
+
+        task = Task(goal=task_goal)
+        if resume_task_id:
+            task.task_id = resume_task_id
+
+        journal = Journal(self.journal_dir, task.task_id)
+        planner = None if simulated else self.planner
+
+        result = run_execution_loop(
+            task,
+            self._step_executor(lambda: simulated),
+            planner=planner,
+            verify=self._verify_step,
+            max_retries=self.config.get("execution.max_retries", 2),
+            journal=journal,
+            checkpoint=self.checkpoint,
+            resume=bool(resume_task_id),
+        )
+
+        result["model"] = "simulated_model" if simulated else target_model
+        result["source"] = self._active_source
+        result["task_id"] = task.task_id
+        result["simulated"] = simulated
+        result["journal"] = str(journal.path)
+        return result
+
+    def execute(self, goal: str, *, resume_task_id: str | None = None) -> dict:
+        """Convenience wrapper with progress output."""
+        print(f"🚀 [NEXUS] task: {goal}")
+        result = self.run_task(goal, resume_task_id=resume_task_id)
+        if result.get("status") == "completed":
+            print(f"🎉 completed in {result['steps']} steps (model: {result['model']})")
+        else:
+            print(f"❌ not completed: {result.get('error') or result.get('status')}")
+        return result
+
+    # ------------------------------------------------------------- multi-agent
+    def run_team(self, goal: str, agents: list[str] | None = None) -> dict:
+        target_model, simulated = self._resolve_backend()
+        self._active_model = target_model
+
+        if simulated:
+            return {
+                "goal": goal,
+                "ok": False,
+                "simulated": True,
+                "summary": "",
+                "conflicts": ["no model backend available"],
+                "subtasks": [],
+            }
+
+        plan = self._select().get("hardware_profile", {})
+        parallel = max(1, int(plan.get("max_parallel_agents", 1)))
+
+        def _chat(messages):
+            return self.chat(messages, use_memory=False)[0]
+
+        team = Coordinator(_chat, max_parallel=parallel).run(goal, agents)
+        payload = team.to_dict()
+        payload["model"] = target_model
+        payload["source"] = self._active_source
+        payload["parallelism"] = parallel
+        return payload
+
 
 if __name__ == "__main__":
-    # 启动测试
     runtime = NexusRuntime()
-    outcome = runtime.run_task("测试一下系统的核心闭环")
+    outcome = runtime.execute("测试一下系统的核心闭环")
     raise SystemExit(0 if outcome.get("status") == "completed" else 1)

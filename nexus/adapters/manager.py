@@ -1,25 +1,93 @@
-from nexus.adapters.base import HostAdapter
+"""Plugin host: ties discovery, lifecycle, permissions and tools together.
 
-class AdapterManager:
-    def __init__(self):
-        self.adapters = {}
+This is the piece that was missing - previously the adapter modules existed but
+nothing ever loaded or called a plugin.
+"""
 
-    def register(self, adapter: HostAdapter):
-        if not isinstance(adapter, HostAdapter):
-            raise TypeError("Invalid adapter")
-        if adapter.name in self.adapters:
-            raise ValueError("Adapter already registered")
-        self.adapters[adapter.name] = adapter
+from __future__ import annotations
 
-    def connect(self, name, config=None):
-        adapter = self.adapters[name]
-        return adapter.connect(config or {})
+from nexus.adapters.context import PluginContext
+from nexus.adapters.lifecycle import PluginLifecycle
+from nexus.adapters.loader import PluginLoadError, PluginLoader
+from nexus.adapters.permissions import PermissionManager
 
-    def disconnect(self, name):
-        self.adapters[name].disconnect()
 
-    def send_message(self, name, message):
-        return self.adapters[name].send_message(message)
+class PluginManager:
+    def __init__(self, plugin_dir="plugins", services: dict | None = None):
+        self.loader = PluginLoader(plugin_dir)
+        self.lifecycle = PluginLifecycle()
+        self.permissions = PermissionManager()
+        self.services = services or {}
+        self.modules: dict[str, object] = {}
+        self.errors: dict[str, str] = {}
 
-    def list_adapters(self):
-        return list(self.adapters.keys())
+    # ------------------------------------------------------------ management
+    def install(self, name: str) -> dict:
+        """Register a discovered plugin and grant its declared permissions."""
+        manifest = self.loader.get(name)
+        if manifest is None:
+            raise PluginLoadError(f"plugin {name!r} not found or manifest invalid")
+        if name not in self.lifecycle.plugins:
+            self.lifecycle.install(name, manifest)
+        self.permissions.grant(name, manifest.get("permissions", []))
+        return manifest
+
+    def activate(self, name: str):
+        """Install (if needed) then import and run setup()."""
+        manifest = self.install(name)
+        self.lifecycle.enable(name)
+        context = PluginContext(name, self.permissions, self.services)
+        try:
+            module = self.loader.load(name, context)
+        except PluginLoadError as exc:
+            # Plugin failures are contained: record and disable, never propagate.
+            self.errors[name] = str(exc)
+            self.lifecycle.disable(name)
+            return None
+        self.modules[name] = module
+        self.errors.pop(name, None)
+        return module
+
+    def deactivate(self, name: str) -> None:
+        module = self.modules.pop(name, None)
+        if module is not None:
+            self.loader.unload(module)
+        self.lifecycle.disable(name)
+
+    def uninstall(self, name: str) -> None:
+        self.deactivate(name)
+        self.lifecycle.uninstall(name)
+        self.permissions.revoke(name)
+        self.modules.pop(name, None)
+        self.errors.pop(name, None)
+
+    # ---------------------------------------------------------------- invokе
+    def call(self, plugin: str, function: str, /, *args, **kwargs):
+        """Call a function exposed by an activated plugin module."""
+        module = self.modules.get(plugin)
+        if module is None:
+            raise PluginLoadError(f"plugin {plugin!r} is not active")
+        fn = getattr(module, function, None)
+        if not callable(fn):
+            raise PluginLoadError(f"plugin {plugin!r} exposes no {function!r}()")
+        return fn(*args, **kwargs)
+
+    def call_tool(self, plugin: str, tool: str, /, **kwargs):
+        """Invoke a tool registered by a plugin through its context services."""
+        service = self.services.get("call_tool")
+        if service is None:
+            raise PluginLoadError("no tool service wired into the plugin host")
+        return service(tool, **kwargs)
+
+    # ----------------------------------------------------------------- state
+    def discover(self) -> list[str]:
+        return [p["name"] for p in self.loader.discover()]
+
+    def status(self) -> dict:
+        return {
+            "discovered": self.discover(),
+            "installed": sorted(self.lifecycle.plugins),
+            "active": sorted(self.modules),
+            "enabled": self.lifecycle.status(),
+            "errors": dict(self.errors),
+        }
