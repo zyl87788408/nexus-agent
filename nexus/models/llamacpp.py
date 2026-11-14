@@ -1,28 +1,28 @@
-import json
-import urllib.request
+"""llama.cpp (server) backend. Traffic is routed through the single egress point."""
+
+from nexus.net import NetworkPolicy, request
+
 
 class LlamaCppBackend:
-    def __init__(self, model="local", host="http://127.0.0.1:8080"):
+    def __init__(self, model="local", host="http://127.0.0.1:8080",
+                 policy: NetworkPolicy | None = None, timeout: float = 180):
         self.model = model
         self.host = host.rstrip("/")
+        self.policy = policy
+        self.timeout = timeout
 
     def generate(self, prompt):
         return self.chat([{"role": "user", "content": prompt}])
 
     def chat(self, messages):
-        data = json.dumps({
-            "model": self.model,
-            "messages": messages,
-            "stream": False
-        }).encode()
-
-        request = urllib.request.Request(
+        result = request(
             self.host + "/v1/chat/completions",
-            data=data,
-            headers={"Content-Type": "application/json"}
+            payload={
+                "model": self.model,
+                "messages": messages,
+                "stream": False,
+            },
+            timeout=self.timeout,
+            policy=self.policy,
         )
-
-        with urllib.request.urlopen(request, timeout=180) as response:
-            result = json.loads(response.read())
-
         return result["choices"][0]["message"]["content"]

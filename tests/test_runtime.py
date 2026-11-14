@@ -142,3 +142,61 @@ class ExecutionLoopTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class BackendEgressTest(unittest.TestCase):
+    """Every backend must reach the network through nexus.net, not around it.
+
+    The local backends originally called `urllib.request.urlopen` directly, so a
+    host pointing at the internet was contacted in offline mode: the request
+    hung for the full timeout and then went out. These tests pin the invariant.
+    """
+
+    def test_local_backends_are_blocked_offline_by_policy(self):
+        from nexus.config import Mode
+        from nexus.models.llamacpp import LlamaCppBackend
+        from nexus.models.ollama import OllamaBackend
+        from nexus.net import CloudBlockedError, NetworkPolicy
+
+        policy = NetworkPolicy(Mode.OFFLINE, allow_cloud=False)
+
+        for backend in (
+            OllamaBackend("m", host="http://example.com:11434", policy=policy),
+            LlamaCppBackend("m", host="http://example.com:8080", policy=policy),
+        ):
+            with self.subTest(backend=type(backend).__name__):
+                with self.assertRaises(CloudBlockedError):
+                    backend.chat([{"role": "user", "content": "hi"}])
+
+    def test_loopback_is_still_allowed(self):
+        from nexus.config import Mode
+        from nexus.net import NetworkPolicy
+
+        self.assertTrue(NetworkPolicy(Mode.OFFLINE).allows("http://127.0.0.1:11434"))
+
+    def test_no_backend_imports_urllib_directly(self):
+        """A guard against someone reintroducing the bypass."""
+        import re
+        from pathlib import Path
+
+        import io
+        import tokenize
+
+        offenders = []
+        for path in (Path(__file__).resolve().parents[1] / "nexus").rglob("*.py"):
+            if path.name == "net.py":
+                continue
+            # Tokenize so a mention inside a comment or docstring does not count.
+            code = []
+            for token in tokenize.generate_tokens(io.StringIO(path.read_text("utf-8")).readline):
+                if token.type not in {tokenize.COMMENT, tokenize.STRING}:
+                    code.append(token.string)
+            # Join without separators: the tokenizer splits `urllib.request`
+            # into NAME/OP/NAME, which a space-joined string would hide.
+            if re.search(
+                r"urlopen|http\.client|requests\.|urllib\.request|"
+                r"socket\.create_connection|httpx|aiohttp",
+                "".join(code),
+            ):
+                offenders.append(path.name)
+        self.assertEqual(offenders, [], f"direct network use in {offenders}")

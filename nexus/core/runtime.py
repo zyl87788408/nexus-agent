@@ -251,7 +251,11 @@ class NexusRuntime:
                 backend_cls = BACKENDS.get(model.get("backend"))
                 if backend_cls is not None:
                     self._simulated = None
-                    self.gateway.set_backend(backend_cls(model["name"]))
+                    host = model.get("host")
+                    kwargs = {"policy": self.policy}
+                    if host:
+                        kwargs["host"] = host
+                    self.gateway.set_backend(backend_cls(model["name"], **kwargs))
                     self._active_source = "local"
                     return model["name"], False
             if mode is Mode.OFFLINE:
