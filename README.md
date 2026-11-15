@@ -327,7 +327,7 @@ nexus/tools/                    Sandbox, tool registry, default tools
 nexus/memory/store.py           SQLite long-term memory
 nexus/agents/, nexus/orchestration/   Specialist agents and coordination
 nexus/adapters/                 Plugin loader, manager, permissions, context
-tests/                          198 tests
+tests/                          242 tests
 ```
 
 ---
@@ -338,7 +338,7 @@ tests/                          198 tests
 python -m unittest discover -s tests -v
 ```
 
-198 tests covering modes, the offline guarantee, execution verification, retries and
+242 tests covering modes, the offline guarantee, execution verification, retries and
 resume, sandbox escapes, memory search, multi-agent concurrency, plugin isolation, the
 HTTP surface and security.
 

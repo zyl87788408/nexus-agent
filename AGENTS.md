@@ -23,7 +23,7 @@ unshare -n .venv/bin/python -m unittest discover -s tests -t .
 ## Commands
 
 ```bash
-.venv/bin/python -m unittest discover -s tests -t . -v   # full suite (198 tests, ~3s)
+.venv/bin/python -m unittest discover -s tests -t . -v   # full suite (242 tests, ~45s)
 .venv/bin/python server.py                               # port 8085, loopback only
 ```
 
