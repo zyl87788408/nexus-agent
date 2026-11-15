@@ -1,11 +1,16 @@
-# NEXUS Agent
+# NEXUS — local model-plane plugin
 
-> **A local model-plane proxy: it takes over an agent engine's model API calls and serves them from your own machine.**
+> **An access-layer plugin for model APIs: it takes over an agent engine's model API calls and serves them from your own machine.**
 
 NEXUS does **not** replace OpenHands, LangChain or any other agent engine. The engine stays
 in charge of planning, tool execution and its agent loop. NEXUS is plugged in at the
 *model API layer* — the engine is pointed at NEXUS's base URL instead of a cloud model, and
 NEXUS serves those `POST /v1/chat/completions` calls from a local model.
+
+"Plugin" here means **access-layer plugin**: you change one base URL and the host picks it
+up. It is not an in-process extension module that the host loads into its own process. (The
+`plugins/` system described below is the *other* kind — an internal extension mechanism for
+adding tools *to NEXUS*. The two live at different levels and do not conflict.)
 
 ```
 host engine  --(OpenAI API)-->  NEXUS  --(Ollama / llama.cpp)-->  local model
@@ -26,7 +31,7 @@ Two design rules drive the whole codebase:
    `nexus/net.py`, which refuses non-loopback connections before a socket is opened.
    Shell execution is the one path that could bypass that gate, so enabling
    `tools.allow_shell` together with OFFLINE mode is rejected at startup rather than
-   running with a guarantee the engine cannot keep. In `auto`/`online` mode shell
+   running with a guarantee NEXUS cannot keep. In `auto`/`online` mode shell
    commands are ordinary processes and are not subject to the egress policy.
 
 ---
@@ -106,7 +111,7 @@ failure honestly rather than claiming success.
 
 ## Honest failure
 
-When no model is available, the engine does not pretend the work succeeded:
+When no model is available, NEXUS does not pretend the work succeeded:
 
 ```json
 {
@@ -218,7 +223,7 @@ plugins/
 rather than loaded in a degraded state.
 
 `setup(context)` receives the host services, so a plugin can add tools to the registry
-the engine actually uses:
+the registry NEXUS actually serves from:
 
 ```python
 from nexus.tools.registry import ToolSpec
@@ -273,7 +278,7 @@ unregistering a tool the plugin did not register. Without that, a plugin holding
 `tools` permission could replace `run_shell` and rewrite its scope.
 
 A plugin that raises during import or `setup()` is contained: the error is recorded in
-`/api/plugins` under `errors`, that plugin is not activated, and the rest of the engine —
+`/api/plugins` under `errors`, that plugin is not activated, and the rest of NEXUS —
 including other plugins — keeps running. Anything it registered before failing is rolled
 back, so a half-initialised plugin never leaves callable tools in the registry.
 

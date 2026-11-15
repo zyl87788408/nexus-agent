@@ -13,7 +13,7 @@ import re
 
 _MAX_STEPS = 12
 
-PROMPT_TEMPLATE = """You are the planning engine of NEXUS AGENT.
+PROMPT_TEMPLATE = """You are the planner inside NEXUS.
 Break this goal into small executable steps.
 Return JSON only:
 {{"steps": ["step 1", "step 2"]}}

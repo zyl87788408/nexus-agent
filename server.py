@@ -34,8 +34,8 @@ runtime = NexusRuntime(config)
 API_KEY = config.server_api_key()
 
 app = FastAPI(
-    title="NEXUS Agent",
-    description="Lightweight local AI engine plugin with an OpenAI-compatible API.",
+    title="NEXUS — local model-plane plugin",
+    description="Access-layer plugin serving an agent engine's model API calls from a local model.",
     version="2.0.0",
 )
 
