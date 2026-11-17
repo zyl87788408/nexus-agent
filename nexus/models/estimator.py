@@ -8,6 +8,25 @@ QUANT_BYTES = {
     "fp16": 2.10,
 }
 
+
+def _base_quant(quant: str) -> str:
+    """Map a concrete GGUF quant name (e.g. `q4_k_m`) to its byte-rate bucket.
+
+    Ollama reports quantisation as `q4_K_M` / `q8_0` / `f16`. Only the leading
+    family is meaningful for size estimation, so look for the longest known
+    prefix and fall back to fp16 rather than raising KeyError.
+    """
+    q = quant.lower().replace("-", "_")
+    for key in sorted(QUANT_BYTES, key=len, reverse=True):
+        if q.startswith(key):
+            return key
+    if q in {"f16", "float16", "bf16"}:
+        return "fp16"
+    if q.startswith("q"):
+        return "q4"
+    return "fp16"
+
+
 def estimate_model_memory(model, context_tokens=2048):
     if isinstance(model, dict):
         name = model.get("name", "")
@@ -26,6 +45,7 @@ def estimate_model_memory(model, context_tokens=2048):
     quant = str(quantization or "").lower()
     if not quant:
         quant = next((q for q in QUANT_BYTES if q in text), "fp16")
+    quant = _base_quant(quant)
 
     if size:
         weight_mb = size / (1024 * 1024)
