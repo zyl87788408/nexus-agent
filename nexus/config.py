@@ -16,6 +16,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import sys
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,11 @@ class Mode(str, Enum):
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if not REPO_ROOT.is_dir():
+    # Running from a zipapp: __file__ points inside the archive, so keep mutable
+    # state (data/, config.json) next to the .pyz instead of inside it.
+    _launcher = Path(sys.argv[0]).resolve()
+    REPO_ROOT = _launcher.parent if _launcher.is_file() else Path.cwd()
 DEFAULT_CONFIG_PATH = Path(
     os.environ.get("NEXUS_CONFIG") or (REPO_ROOT / "data" / "config.json")
 )
@@ -185,8 +191,34 @@ class Config:
         return bool(self._data["cloud"].get("enabled"))
 
     def cloud_api_key(self) -> str | None:
+        """Resolve the cloud API key.
+
+        Order: environment variable first (deployment-friendly), then a
+        dedicated file. The key is deliberately NOT stored in config.json:
+        config.json gets attached to diagnostics bundles, and a key in there
+        would be emailed around in plaintext.
+        """
         env_name = self._data["cloud"].get("api_key_env")
-        return os.environ.get(env_name) if env_name else None
+        value = os.environ.get(env_name) if env_name else None
+        if value:
+            return value
+        key_file = self.path.parent / "cloud.key"
+        try:
+            if key_file.is_file():
+                return key_file.read_text("utf-8").strip() or None
+        except OSError:
+            return None
+        return None
+
+    def save_cloud_key(self, key: str) -> Path:
+        key_file = self.path.parent / "cloud.key"
+        key_file.parent.mkdir(parents=True, exist_ok=True)
+        key_file.write_text(key.strip(), "utf-8")
+        try:
+            key_file.chmod(0o600)
+        except OSError:
+            pass
+        return key_file
 
     def server_api_key(self) -> str | None:
         env_name = self._data["server"].get("api_key_env")
