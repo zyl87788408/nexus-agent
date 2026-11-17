@@ -249,6 +249,35 @@ class NexusRuntime:
             policy=self.policy,
         )
 
+    def _try_cloud_fallback(self, payload, tools, exc):
+        """本地失败后尝试云端。
+
+        仅在 AUTO 且云端已启用并授权时生效：
+        OFFLINE 绝不能外溢，ONLINE 本来就只走云端。
+        """
+        if self.config.mode is not Mode.AUTO:
+            return None
+        if not (self.config.cloud_enabled and self.config.allow_cloud):
+            return None
+        cloud = self._cloud_backend()
+        if cloud is None:
+            return None
+        try:
+            if hasattr(cloud, "chat_full"):
+                message = cloud.chat_full(payload, tools=tools)
+            elif hasattr(cloud, "chat"):
+                message = {"role": "assistant",
+                           "content": _call_chat(cloud, payload, tools)}
+            else:
+                message = {"role": "assistant",
+                           "content": cloud.generate(_build_prompt(payload))}
+        except Exception as cloud_exc:
+            print(f"⚠️    local backend failed ({exc}); "
+                  f"cloud fallback also failed ({cloud_exc})")
+            return None
+        print(f"ℹ️    local backend failed ({exc}); answered by cloud")
+        return message, cloud.model
+
     def _select(self, *, probe: bool = False) -> dict:
         """Call the selector while tolerating injected selectors without `probe`."""
         try:
@@ -256,8 +285,23 @@ class NexusRuntime:
         except TypeError:
             return self.selector.select()
 
-    def _resolve_backend(self, *, probe: bool = False):
-        """Choose a backend while honouring the offline guarantee."""
+    @staticmethod
+    def _pick(candidates: list[dict], prefer: str | None) -> dict:
+        """Honour a requested model name when it is among the affordable ones."""
+        if prefer:
+            for item in candidates:
+                if item.get("name") == prefer:
+                    return item
+        return candidates[0]
+
+    def _resolve_backend(self, *, probe: bool = False, prefer: str | None = None):
+        """Choose a backend while honouring the offline guarantee.
+
+        `prefer` is a model name requested by the caller. It only reorders the
+        candidates already deemed affordable; a name that is unknown or does not
+        fit the memory budget is ignored rather than trusted, so a client cannot
+        make the box load a model it cannot hold.
+        """
         # Any explicitly injected backend wins, including a simulated one: the
         # caller asked for it, so discovery must not override that choice.
         backend = self.gateway.backend
@@ -270,7 +314,7 @@ class NexusRuntime:
             selection = self._select(probe=probe)
             candidates = selection.get("candidates") or []
             if candidates:
-                model = candidates[0]
+                model = self._pick(candidates, prefer)
                 backend_cls = BACKENDS.get(model.get("backend"))
                 if backend_cls is not None:
                     self._simulated = None
@@ -311,7 +355,7 @@ class NexusRuntime:
         return text, model
 
     def chat_message(self, messages: list[dict], *, tools=None,
-                     use_memory: bool = True):
+                     use_memory: bool = True, model: str | None = None):
         """Return the assistant message dict, including `tool_calls` if any.
 
         `chat_detail()` returns only text, which is enough for a plain chatbot
@@ -319,8 +363,11 @@ class NexusRuntime:
         by receiving `tool_calls`, executing them, and feeding results back. A
         proxy that strips `tool_calls` makes the host look broken while the
         model behaved correctly.
+
+        `model` is the client's requested model name; it is honoured only if it
+        is already installed and affordable (see `_resolve_backend`).
         """
-        target_model, simulated = self._resolve_backend()
+        target_model, simulated = self._resolve_backend(prefer=model)
         self._active_model = target_model
 
         backend = self.gateway.backend
@@ -355,7 +402,16 @@ class NexusRuntime:
         except Exception as exc:
             if type(exc).__name__ not in NETWORK_ERRORS:
                 raise
-            print(f"⚠️   backend {target_model} unavailable ({exc}); using simulation")
+            # 本地后端中途失效（Ollama 停了、模型被卸载）。AUTO 模式且已授权云端时，
+            # 转给云端 API，而不是直接退回假回复——这才是 auto 的含义。
+            cloud = self._try_cloud_fallback(payload, tools, exc)
+            if cloud is not None:
+                message, cloud_model = cloud
+                self._active_model = cloud_model
+                self._active_source = "cloud"
+                return message, cloud_model, "cloud"
+
+            print(f"⚠️    backend {target_model} unavailable ({exc}); using simulation")
             text = self._simulated_backend().chat(messages)
             self._active_model = "simulated_model"
             return ({"role": "assistant", "content": text},

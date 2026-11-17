@@ -18,7 +18,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, Header
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from nexus.config import Config, Mode
 from nexus.core.runtime import NexusRuntime
 from nexus.adapters.loader import PluginLoadError
+from nexus.models.registry import discover_models
 from nexus.net import CloudBlockedError
 
 config = Config.load()
@@ -75,6 +76,15 @@ class ModeRequest(BaseModel):
     mode: str
     allow_cloud: bool | None = None
     persist: bool = True
+
+
+class CloudConfigRequest(BaseModel):
+    """配置云端 API。key 不落 config.json，单独存 data/cloud.key。"""
+
+    base_url: str | None = None
+    model: str | None = None
+    api_key: str | None = None
+    enabled: bool | None = None
 
 
 class TaskRequest(BaseModel):
@@ -131,6 +141,47 @@ def health():
 @app.get("/api/status")
 def status():
     return runtime.status()
+
+
+@app.get("/api/cloud")
+def get_cloud():
+    """返回云端配置（绝不返回 key 本身，只返回是否已配置）。"""
+    return {
+        "enabled": config.cloud_enabled,
+        "base_url": config.get("cloud.base_url"),
+        "model": config.get("cloud.model"),
+        "has_key": bool(config.cloud_api_key()),
+    }
+
+
+@app.post("/api/cloud")
+def set_cloud(request: CloudConfigRequest,
+              authorization: str | None = Header(default=None)):
+    if not _authorized(authorization):
+        return _error(401, "Invalid API key", "authentication_error", "invalid_api_key")
+
+    if request.base_url is not None:
+        url = request.base_url.strip()
+        if url and not url.startswith(("http://", "https://")):
+            return _error(400, "base_url must start with http:// or https://")
+        config.set("cloud.base_url", url or "https://api.openai.com/v1")
+    if request.model is not None:
+        config.set("cloud.model", request.model.strip())
+    if request.enabled is not None:
+        config.set("cloud.enabled", bool(request.enabled))
+    if request.api_key is not None:
+        if request.api_key.strip():
+            config.save_cloud_key(request.api_key)
+        else:
+            # 空字符串 = 清除已保存的密钥。以 config.json 所在目录为准，
+            # 不用 cwd —— 服务可能从任意目录启动。
+            try:
+                (config.path.parent / "cloud.key").unlink()
+            except OSError:
+                pass
+
+    config.save()
+    return {"ok": True, **get_cloud()}
 
 
 @app.get("/api/modes")
@@ -316,13 +367,238 @@ def set_plugin_state(name: str, request: PluginStateRequest,
 
 @app.get("/v1/models")
 def list_models():
-    return {
-        "object": "list",
-        "data": [
-            {"id": "nexus-local", "object": "model",
-             "created": int(time.time()), "owned_by": "nexus"}
-        ],
+    """List the models actually available locally.
+
+    Clients populate their model picker from this endpoint, so returning a
+    single synthetic name made every installed model invisible and left users
+    unable to choose. Names are reported as installed; affordability is decided
+    per request, so listing a large model here does not force it to load.
+    """
+    try:
+        discovered = discover_models()
+    except Exception:
+        discovered = []
+
+    data = [
+        {
+            "id": item.get("name", ""),
+            "object": "model",
+            "created": int(time.time()),
+            "owned_by": item.get("backend") or "local",
+        }
+        for item in discovered
+        if item.get("name")
+    ]
+    if not data:
+        # Keep the endpoint usable with no model installed: an empty list makes
+        # some clients fail to start up rather than showing "no model".
+        data = [{"id": "nexus-local", "object": "model",
+                 "created": int(time.time()), "owned_by": "nexus"}]
+    return {"object": "list", "data": data}
+
+
+# ---------------------------------------------------------------- control panel
+_PANEL_HTML = """<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NEXUS 控制面板</title>
+<style>
+:root{--bg:#12141a;--card:#1b1e27;--line:#2b3040;--txt:#e6e8ee;--dim:#8b93a7;
+      --local:#2ecc71;--api:#4a9eff;--auto:#b46cff;--warn:#f5a524;--err:#e5484d}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--txt);font:14px/1.6 -apple-system,"Segoe UI",
+     "Microsoft YaHei",sans-serif;padding:16px;min-height:100vh}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px;margin-bottom:12px}
+h1{font-size:15px;font-weight:600;margin-bottom:2px;letter-spacing:.3px}
+.sub{color:var(--dim);font-size:12px;margin-bottom:14px}
+.opts{display:flex;flex-direction:column;gap:8px}
+.opt{display:flex;align-items:center;gap:10px;padding:11px 13px;border-radius:8px;
+     border:1px solid var(--line);background:#161922;cursor:pointer;transition:.15s;
+     user-select:none;position:relative}
+.opt:hover{border-color:#3d4459;background:#1a1e29}
+.opt.on{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 12%,#161922)}
+.dot{width:9px;height:9px;border-radius:50%;background:#394054;flex:0 0 auto;transition:.15s}
+.opt.on .dot{background:var(--accent);box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 22%,transparent)}
+.opt .t{font-weight:500}
+.opt .d{color:var(--dim);font-size:11.5px;line-height:1.4}
+.st{margin-left:auto;font-size:11px;padding:2px 7px;border-radius:5px;background:#232838;color:var(--dim)}
+.opt.on .st{background:color-mix(in srgb,var(--accent) 20%,transparent);color:var(--accent)}
+.row{display:flex;align-items:center;justify-content:space-between;padding:7px 0;
+     border-bottom:1px solid #22263220}
+.row:last-child{border-bottom:none}
+.row .k{color:var(--dim);font-size:12.5px}
+.row .v{font-size:12.5px;font-weight:500;max-width:60%;text-align:right;
+        overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ok{color:var(--local)}.bad{color:var(--err)}.warn{color:var(--warn)}
+#msg,#msg2{padding:9px 12px;border-radius:7px;font-size:12.5px;display:none;margin-top:4px}
+#msg.show,#msg2.show{display:block}
+#msg.ok,#msg2.ok{background:#1a2e22;color:#7ee2a8;border:1px solid #24523a}
+#msg.err,#msg2.err{background:#2e1a1c;color:#f08c90;border:1px solid #52242a}
+#msg.info,#msg2.info{background:#1a2233;color:#8fb8f0;border:1px solid #243a52}
+.foot{color:var(--dim);font-size:11px;text-align:center;margin-top:6px;line-height:1.7}
+a{color:var(--api);text-decoration:none}
+.grp{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.6px;
+     margin:0 0 7px 2px}
+.fl{display:block;color:var(--dim);font-size:11.5px;margin:9px 0 0}
+.fl input{width:100%;margin-top:4px;padding:7px 9px;border-radius:6px;
+  border:1px solid var(--line);background:#161922;color:var(--txt);
+  font:12.5px/1.4 inherit;outline:none}
+.fl input:focus{border-color:var(--api)}
+.btn{width:100%;margin-top:11px;padding:9px;border-radius:6px;border:1px solid var(--line);
+  background:#20283a;color:var(--txt);font:13px inherit;cursor:pointer;transition:.15s}
+.btn:hover{background:#27324a;border-color:var(--api)}
+</style></head><body>
+
+<div class="card">
+  <h1>NEXUS 模型来源</h1>
+  <div class="sub">点一下即生效，客户端无需改动</div>
+  <div class="opts">
+    <div class="opt" data-mode="offline" style="--accent:var(--local)">
+      <span class="dot"></span>
+      <span><span class="t">本地模型</span><br>
+            <span class="d">只用自己的电脑，绝不联网</span></span>
+      <span class="st">离线</span>
+    </div>
+    <div class="opt" data-mode="auto" style="--accent:var(--auto)">
+      <span class="dot"></span>
+      <span><span class="t">自动</span><br>
+            <span class="d">优先本地；本地不可用时自动切 API</span></span>
+      <span class="st">推荐</span>
+    </div>
+    <div class="opt" data-mode="online" style="--accent:var(--api)">
+      <span class="dot"></span>
+      <span><span class="t">云端 API</span><br>
+            <span class="d">始终用 API，效果最好但需联网</span></span>
+      <span class="st">联网</span>
+    </div>
+  </div>
+  <div id="msg"></div>
+</div>
+
+<div class="card">
+  <div class="grp">当前状态</div>
+  <div class="row"><span class="k">模式</span><span class="v" id="s-mode">—</span></div>
+  <div class="row"><span class="k">正在使用</span><span class="v" id="s-model">—</span></div>
+  <div class="row"><span class="k">来源</span><span class="v" id="s-src">—</span></div>
+  <div class="row"><span class="k">本地模型</span><span class="v" id="s-local">—</span></div>
+  <div class="row"><span class="k">API 授权</span><span class="v" id="s-allow">—</span></div>
+</div>
+
+<div class="card">
+  <div class="grp">API 设置</div>
+  <div class="row"><span class="k">状态</span><span class="v" id="s-cloud">—</span></div>
+  <div class="row"><span class="k">密钥</span><span class="v" id="s-key">—</span></div>
+  <label class="fl">服务地址
+    <input id="i-url" placeholder="https://api.openai.com/v1" spellcheck="false">
+  </label>
+  <label class="fl">模型名
+    <input id="i-model" placeholder="gpt-4o-mini" spellcheck="false">
+  </label>
+  <label class="fl">API 密钥
+    <input id="i-key" type="password" placeholder="sk-…（留空则不改）" spellcheck="false">
+  </label>
+  <button id="save" class="btn">保存并启用</button>
+  <div id="msg2"></div>
+</div>
+
+<div class="foot">
+  <span id="link"><a href="/docs" target="_blank">接口文档</a> ·
+  <a href="/health" target="_blank">健康检查</a></span><br>
+  <span id="ts"></span>
+</div>
+
+<script>
+const $=s=>document.querySelector(s);
+const SRCN={local:"本地",cloud:"云端 API",simulated:"兜底(未就绪)"};
+
+function flash(el,txt,kind){
+  el.textContent=txt; el.className="show "+kind;
+  clearTimeout(el._t); el._t=setTimeout(()=>el.className="",4200);
+}
+function paint(mode,allowed){
+  document.querySelectorAll(".opt").forEach(o=>{
+    o.classList.toggle("on", o.dataset.mode===mode);
+  });
+}
+async function refresh(){
+  try{
+    const m=await (await fetch("/api/modes")).json();
+    paint(m.current,m.cloud_allowed);
+    $("#s-mode").textContent={offline:"本地模型",auto:"自动",online:"云端 API"}[m.current]||m.current;
+    $("#s-allow").innerHTML = m.cloud_allowed
+      ? '<span class="ok">已授权</span>' : '<span class="warn">未授权</span>';
+    $("#s-cloud").innerHTML = m.cloud_enabled
+      ? '<span class="ok">已启用</span>' : '<span class="bad">未启用</span>';
+
+    const s=await (await fetch("/api/status")).json();
+    const src=s.active_source||"—";
+    $("#s-src").textContent=SRCN[src]||src;
+    $("#s-src").className="v "+(src==="local"?"ok":src==="cloud"?"":"warn");
+    $("#s-model").textContent=s.active_model||"未选择";
+    $("#s-local").innerHTML = s.simulated
+      ? '<span class="warn">未检测到可用模型</span>'
+      : '<span class="ok">就绪</span>';
+
+    const c=await (await fetch("/api/cloud")).json();
+    $("#s-key").innerHTML = c.has_key
+      ? '<span class="ok">已保存</span>' : '<span class="bad">未设置</span>';
+    if(document.activeElement!==$("#i-url"))   $("#i-url").value=c.base_url||"";
+    if(document.activeElement!==$("#i-model")) $("#i-model").value=c.model||"";
+    $("#ts").textContent="更新于 "+new Date().toLocaleTimeString();
+  }catch(e){
+    $("#s-mode").innerHTML='<span class="bad">无法连接服务</span>';
+  }
+}
+async function setMode(mode){
+  const need = mode==="online" || mode==="auto";
+  const body={mode:mode, persist:true};
+  if(need) body.allow_cloud=true;
+  if(mode==="offline") body.allow_cloud=false;
+
+  try{
+    const r=await fetch("/api/mode",{method:"POST",
+      headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+    const d=await r.json();
+    if(!r.ok){ flash($("#msg"),"切换失败："+(d.detail||d.message||r.status),"err"); return; }
+    if(d.verified){
+      flash($("#msg"),"已切换到「"+({offline:"本地模型",auto:"自动",online:"云端 API"}[mode])+"」","ok");
+    }else{
+      const e=(d.detail&&d.detail.error)||"后端暂不可用";
+      flash($("#msg"),"已切换，但当前不可用："+e,"err");
     }
+    await refresh();
+  }catch(e){
+    flash($("#msg"),"网络错误："+e.message,"err");
+  }
+}
+document.querySelectorAll(".opt").forEach(o=>{
+  o.onclick=()=>setMode(o.dataset.mode);
+});
+
+$("#save").onclick=async()=>{
+  const body={enabled:true};
+  const url=$("#i-url").value.trim();   if(url)   body.base_url=url;
+  const mdl=$("#i-model").value.trim(); if(mdl)   body.model=mdl;
+  const key=$("#i-key").value.trim();   if(key)   body.api_key=key;
+  try{
+    const r=await fetch("/api/cloud",{method:"POST",
+      headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+    const d=await r.json();
+    if(!r.ok){ flash($("#msg2"),"保存失败："+(d.detail||r.status),"err"); return; }
+    $("#i-key").value="";
+    flash($("#msg2"),"已保存。点上方「API」或「自动」即可使用","ok");
+    await refresh();
+  }catch(e){ flash($("#msg2"),"网络错误："+e.message,"err"); }
+};
+
+refresh(); setInterval(refresh,5000);
+</script></body></html>"""
+
+
+@app.get("/panel", response_class=HTMLResponse)
+def panel():
+    """模型来源控制面板 — 浏览器可开，也可做成桌面悬浮窗。"""
+    return HTMLResponse(_PANEL_HTML)
 
 
 @app.post("/v1/chat/completions")
@@ -336,7 +612,8 @@ def chat_completions(request: ChatCompletionRequest,
     messages = [m.model_dump(exclude_none=True) for m in request.messages]
 
     try:
-        message, model_used, source = runtime.chat_message(messages, tools=request.tools)
+        message, model_used, source = runtime.chat_message(
+            messages, tools=request.tools, model=request.model)
         text = message.get("content") or ""
         tool_calls = _normalise_tool_calls(message.get("tool_calls"))
     except CloudBlockedError as exc:
@@ -401,6 +678,42 @@ def _stream_chunks(completion_id, created, model, text):
     yield "data: [DONE]\n\n"
 
 
+def _setup_file_logging() -> Path:
+    """把运行日志落到 data/logs/nexus.log。
+
+    开机自启时进程无可见窗口，日志是远程排障的唯一线索。
+    """
+    import logging
+
+    log_dir = Path(sys.argv[0]).resolve().parent / "data" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / "nexus.log"
+
+    handler = logging.FileHandler(log_file, encoding="utf-8")
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    ))
+
+    # 只挂在 root 上：uvicorn 的 logger 会向上冒泡，
+    # 若同时给 "uvicorn"/"uvicorn.error" 挂 handler，每条会写 2-3 遍。
+    root = logging.getLogger()
+    if not any(isinstance(h, logging.FileHandler) for h in root.handlers):
+        root.addHandler(handler)
+    root.setLevel(logging.INFO)
+
+    # 简单滚动：超过 5 MB 就轮换一次，避免长期运行撑满磁盘
+    try:
+        if log_file.exists() and log_file.stat().st_size > 5 * 1024 * 1024:
+            backup = log_dir / "nexus.log.1"
+            if backup.exists():
+                backup.unlink()
+            log_file.rename(backup)
+    except OSError:
+        pass
+
+    return log_file
+
+
 def main() -> int:
     import uvicorn
 
@@ -416,9 +729,11 @@ def main() -> int:
         )
         return 2
 
+    log_file = _setup_file_logging()
     print(f"NEXUS listening on http://{host}:{port} (mode={config.mode.value}, "
           f"auth={'on' if API_KEY else 'off'})")
-    uvicorn.run(app, host=host, port=port)
+    print(f"log file: {log_file}")
+    uvicorn.run(app, host=host, port=port, log_config=None)
     return 0
 
 

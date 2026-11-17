@@ -2,6 +2,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -102,10 +103,18 @@ class ChatCompletionsTest(unittest.TestCase):
 
 
 class ModelsEndpointTest(unittest.TestCase):
-    def test_lists_nexus_model(self):
+    def test_lists_installed_models(self):
         client = TestClient(server.app)
         body = client.get("/v1/models").json()
         self.assertEqual(body["object"], "list")
+        self.assertTrue(body["data"])
+        for item in body["data"]:
+            self.assertIn("id", item)
+            self.assertEqual(item["object"], "model")
+
+    def test_placeholder_when_nothing_installed(self):
+        with patch("server.discover_models", return_value=[]):
+            body = TestClient(server.app).get("/v1/models").json()
         self.assertEqual(body["data"][0]["id"], "nexus-local")
 
     def test_health(self):
