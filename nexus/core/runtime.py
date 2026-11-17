@@ -457,6 +457,13 @@ class NexusRuntime:
         except Exception as exc:
             if type(exc).__name__ not in NETWORK_ERRORS:
                 raise
+            cloud = self._try_cloud_fallback(payload, None, exc)
+            if cloud is not None:
+                message, cloud_model = cloud
+                self._active_model = cloud_model
+                self._active_source = "cloud"
+                return message.get("content", ""), cloud_model, "cloud"
+
             print(f"⚠️  backend {target_model} unavailable ({exc}); using simulation")
             text = self._simulated_backend().chat(messages)
             self._active_model = "simulated_model"

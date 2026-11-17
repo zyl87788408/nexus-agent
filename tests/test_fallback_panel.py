@@ -33,6 +33,12 @@ class DeadLocal:
     def chat_full(self, payload, tools=None):
         raise ConnectionError("local down")
 
+    def chat(self, payload):
+        raise ConnectionError("local down")
+
+    def generate(self, prompt):
+        raise ConnectionError("local down")
+
 
 def build(mode, allow_cloud, cloud_fail=False, enabled=True):
     cfg = Config(data={
@@ -77,6 +83,20 @@ class CloudFallbackTest(unittest.TestCase):
     def test_auto_does_not_fall_back_when_cloud_disabled(self):
         runtime = build("auto", True, enabled=False)
         _, _, source = runtime.chat_message([{"role": "user", "content": "hi"}])
+        self.assertEqual(source, "simulated")
+
+    def test_chat_detail_also_falls_back_to_cloud(self):
+        """chat_detail() backs the /v1/chat path; it needs the same fallback."""
+        runtime = build("auto", True)
+        text, model, source = runtime.chat_detail(
+            [{"role": "user", "content": "hi"}])
+        self.assertEqual(source, "cloud")
+        self.assertEqual(model, "cloud-model")
+        self.assertEqual(text, "CLOUD")
+
+    def test_chat_detail_keeps_offline_guarantee(self):
+        runtime = build("offline", True)
+        _, _, source = runtime.chat_detail([{"role": "user", "content": "hi"}])
         self.assertEqual(source, "simulated")
 
     def test_failed_cloud_fallback_degrades_to_simulation(self):
