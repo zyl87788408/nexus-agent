@@ -42,5 +42,3 @@ plugins/
 *.db
 *.db-journal
 *.jsonl
-data/*
-!data/.gitkeep
