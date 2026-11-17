@@ -8,11 +8,14 @@ listing may still fail to load (corrupt blob, insufficient RAM).
 from __future__ import annotations
 
 import json
+import os
 
 from nexus.net import NetworkPolicy, NetworkError, request
 
-OLLAMA_HOST = "http://127.0.0.1:11434"
-LLAMACPP_HOST = "http://127.0.0.1:8080"
+# Defaults only. Both are overridable so a customer running Ollama on another
+# port or a second machine does not need to edit source.
+OLLAMA_HOST = os.environ.get("NEXUS_OLLAMA_HOST") or "http://127.0.0.1:11434"
+LLAMACPP_HOST = os.environ.get("NEXUS_LLAMACPP_HOST") or "http://127.0.0.1:8080"
 
 
 def _fetch(url: str, policy: NetworkPolicy | None = None):
