@@ -1,0 +1,192 @@
+﻿==================================================
+NEXUS 引擎 - Mac 部署命令
+==================================================
+
+使用前请注意：
+1. 先在终端执行 cd ，把下面第 1 步的路径改成你实际解压的目录。
+2. 把 4 段命令按顺序复制粘贴到「终端」(Terminal) 里执行，每段粘贴后按回车。
+3. 需要 macOS 自带 Python3 或已安装 Python 3.10 以上版本。
+4. 程序已打包成单文件 nexus.pyz，解压后本目录应有：
+     nexus.pyz          程序本体
+     requirements.txt   依赖清单
+     本说明文件
+   data/ 和 plugins/ 会在首次启动时自动创建，不用管。
+
+
+--- 第 0 步：检查环境（可选，但建议先跑） ---
+
+python3 --version && sysctl -n hw.memsize | awk '{printf "内存: %.0f GB\n", $1/1024/1024/1024}'
+
+
+--- 第 1 步：进入程序目录（路径请改成你自己的） ---
+
+cd ~/Desktop/nexus-agent
+
+
+--- 第 2 步：安装依赖（使用清华镜像源加速） ---
+
+python3 -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+
+--- 第 3 步：启动服务 ---
+
+python3 nexus.pyz
+
+
+==================================================
+启动成功的样子
+==================================================
+
+终端会显示：
+NEXUS listening on http://127.0.0.1:8085 (mode=..., auth=off)
+
+然后另开一个新的终端窗口，执行下面这行验证：
+
+curl -s http://127.0.0.1:8085/health
+
+看到 {"status":"ok","service":"nexus-agent","version":"2.0.0"} 即表示部署成功。
+
+
+==================================================
+常见问题
+==================================================
+
+【提示 command not found: python3】
+  说明系统没装 Python3，请到 https://www.python.org/downloads/macos/ 下载安装，
+  或用 Homebrew 安装：brew install python@3.12
+
+【提示 No module named pip】
+  执行：python3 -m ensurepip --upgrade
+  然后再回到第 2 步。
+
+【提示 externally-managed-environment】
+  这是较新版本 Homebrew Python 的保护机制，改用：
+  python3 -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple --break-system-packages
+
+【提示 Address already in use / 端口被占用】
+  执行下面命令找到占用进程并结束（把 12345 换成实际显示的 PID）：
+  lsof -i :8085
+  kill -9 12345
+
+【依赖下载很慢或超时】
+  换阿里云镜像源重试：
+  python3 -m pip install -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/
+
+【停止服务】
+  在运行服务的终端窗口按 Control + C
+
+
+==================================================
+给客服的说明
+==================================================
+
+· Mac 上没有 .bat 脚本，以上命令即等效于 Windows 的一键部署。
+· 如果客户完全不会用终端，建议改用远程桌面代为操作。
+· 报错时请客户截图「终端完整窗口内容」，不要只截最后一行。
+
+==================================================
+第 4 步：安装模型（NEXUS 启动后才能做，也可提前做）
+==================================================
+
+NEXUS 本身只是个"调度层"，它自己不包含模型。
+必须先装一个本地模型服务，NEXUS 才能真的回答问题。
+两种任选其一，推荐 Ollama（简单）。
+
+【方案 A：Ollama（推荐）】
+
+1) 安装 Ollama
+   到 https://ollama.com/download 下载 macOS 版，双击安装。
+   或用 Homebrew：
+   brew install ollama
+
+2) 启动 Ollama 服务（保持这个终端窗口开着）
+   ollama serve
+
+3) 另开一个终端，下载模型（按内存选，见下方对照表）
+   ollama pull qwen2.5:3b
+
+4) 验证模型已就绪
+   curl -s http://127.0.0.1:11434/api/tags
+
+   看到包含 "qwen2.5:3b" 的 JSON 即为成功。
+   此时回到 NEXUS，直接发问题就能得到真实回答，无需重启 NEXUS。
+
+
+【方案 B：llama.cpp（进阶，需要 GGUF 文件）】
+
+   brew install llama.cpp
+   llama-server -m /你的路径/model.gguf --port 8080
+
+   NEXUS 会自动探测 127.0.0.1:8080 上的 /v1/models。
+
+
+==================================================
+模型和内存对照表（重要）
+==================================================
+
+ 内存      推荐安装        说明
+ ------  --------------  ------------------------------
+  8 GB    qwen2.5:3b      7B 需要约 5.8 GB，8GB 机器通常放不下
+ 16 GB    qwen2.5:7b      14B 需要约 11.4 GB，容易吃满内存
+ 32 GB    qwen2.5:14b     32B 需要约 25.8 GB，仅勉强可跑
+
+ 参考估算（含运行开销）：
+   qwen2.5:0.5b  约 0.6 GB
+   qwen2.5:3b    约 2.6 GB
+   qwen2.5:7b    约 5.8 GB
+   qwen2.5:14b   约 11.4 GB
+   qwen2.5:32b   约 25.8 GB
+
+ 注意：NEXUS 会预留约 900 MB 给系统，所以"内存够装"要求
+ 空闲内存 > 模型估算值 + 900 MB。内存吃紧时装大模型会非常
+ 慢甚至卡死，宁可选小一号。
+
+ 装错了想换？直接再 pull 一个小模型即可，NEXUS 会自动选用
+ 能装下的那个，不用卸载旧模型。
+
+
+==================================================
+怎么确认模型真的生效了（不是兜底回答）
+==================================================
+
+向 NEXUS 发一个测试问题：
+
+curl -s -X POST http://127.0.0.1:8085/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"x","messages":[{"role":"user","content":"1+1=?"}]}'
+
+看返回 JSON 里的 nexus.simulated 字段：
+  "simulated": false  → 模型正常，是真实推理结果
+  "simulated": true   → 没找到模型，返回的是兜底文字
+
+如果回答里出现 "[simulated] NEXUS 未检测到可用的推理后端"，
+说明模型还没装好，回到第 4 步。
+
+==================================================
+想让 NEXUS 用指定的模型？（可选）
+==================================================
+
+装了多个模型时，NEXUS 默认自动选"内存放得下的最大那个"。
+如果你有偏好，可以指定：
+
+【方法一：在客户端里选（推荐）】
+  Cherry Studio / Open WebUI / AnythingLLM 等客户端
+  会自动从 NEXUS 读取模型列表，直接在模型下拉框里选即可。
+
+  下拉框里看到的，就是你 ollama list 里已装好的模型。
+
+【方法二：请求里指定】
+  curl -s -X POST http://127.0.0.1:8085/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{"model":"qwen2.5:3b",
+         "messages":[{"role":"user","content":"你好"}]}'
+
+  把 model 换成你想要的名字。返回里的 model 字段会告诉你
+  实际用了哪个。
+
+【注意】
+  - 指定的模型必须是已安装的（ollama list 能看到）
+  - 如果指定的模型超出本机内存，NEXUS 会忽略它、自动选合适的，
+    不会硬加载导致卡死
+  - 名字写错不会报错，会静默回落到自动选择
+  - 不指定 model 时，行为跟以前完全一样
