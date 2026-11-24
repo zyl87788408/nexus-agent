@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import stat
 from pathlib import Path
 
 ALLOWED_PERMISSIONS = {"filesystem", "model", "tools", "memory"}
@@ -101,6 +103,8 @@ class PluginLoader:
         if not module_path.exists():
             return None
 
+        self._check_ownership(module_path)
+
         spec = importlib.util.spec_from_file_location(
             f"nexus_plugin_{name}", module_path
         )
@@ -125,6 +129,30 @@ class PluginLoader:
                     f"setup() failed: {type(exc).__name__}: {exc}"
                 ) from exc
         return module
+
+    def _check_ownership(self, module_path: Path) -> None:
+        """Refuse to import code another local user could have written.
+
+        Loading a plugin runs it in-process, so its directory is a trust
+        boundary. If that directory is group/world-writable, anyone on the
+        machine can drop a module there and get code execution on the next
+        start. Only the plugin's own directory is checked: its parents
+        (``/tmp``, the home directory) are writable by design and say nothing
+        about who controls this specific plugin.
+        """
+        if os.name != "posix":
+            return
+        st = module_path.parent.stat()
+        if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise PluginLoadError(
+                f"{module_path.parent} is group/world-writable; refusing to "
+                "load code from a directory other users can modify"
+            )
+        if st.st_uid != os.getuid():
+            raise PluginLoadError(
+                f"{module_path.parent} is owned by uid {st.st_uid}; "
+                "expected the current user"
+            )
 
     def unload(self, module) -> None:
         shutdown = getattr(module, "shutdown", None)

@@ -178,6 +178,40 @@ class ToolRegistryTest(unittest.TestCase):
         self.assertTrue(specs["read_file"]["callable"])
         self.assertFalse(specs["run_shell"]["callable"])
 
+    def test_shell_rejects_shell_syntax(self):
+        """The old implementation used shell=True, so `echo `id`` escaped."""
+        self.registry.grant("shell")
+        self.registry.sandbox.allow_shell = True
+        for command in (
+            "echo `id`",
+            "echo $(id)",
+            "ls | wc -l",
+            "echo hi > out.txt",
+            "echo hi && id",
+            "cat ~/.ssh/id_rsa",
+            "sh -c id",
+            "bash -c id",
+        ):
+            result = self.registry.call("run_shell", command=command)
+            self.assertFalse(result.ok, f"{command!r} was allowed")
+            self.assertIn("sandbox", result.error.lower(), command)
+
+    def test_shell_rejects_inline_interpreter_code(self):
+        self.registry.grant("shell")
+        self.registry.sandbox.allow_shell = True
+        result = self.registry.call(
+            "run_shell", command='python3 -c "import os; os.system(\'id\')"'
+        )
+        self.assertFalse(result.ok)
+        self.assertIn("inline code", result.error)
+
+    def test_shell_runs_an_allowed_program_without_a_shell(self):
+        self.registry.grant("shell")
+        self.registry.sandbox.allow_shell = True
+        result = self.registry.call("run_shell", command="echo a b")
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(result.output["stdout"].strip(), "a b")
+
     def test_duplicate_registration_is_refused(self):
         with self.assertRaises(ValueError):
             self.registry.register(

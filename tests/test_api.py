@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -216,12 +217,31 @@ class SecurityTest(unittest.TestCase):
         self.assertEqual(self.client.get("/health").status_code, 200)
         self.assertEqual(self.client.get("/v1/models").status_code, 200)
 
-    def test_refuses_public_bind_without_key(self):
+    def test_refuses_public_bind_when_auth_is_disabled(self):
+        # Auth is on by default now, so a public bind is only unsafe when the
+        # operator has explicitly turned authentication off.
         original_key = server.API_KEY
+        original_require = server.config.get("server.require_auth")
         server.API_KEY = None
         try:
+            server.config.set("server.require_auth", False)
             server.config.set("server.host", "0.0.0.0")
             self.assertEqual(server.main(), 2)
+        finally:
+            server.API_KEY = original_key
+            server.config.set("server.require_auth", original_require)
+            server.config.set("server.host", "127.0.0.1")
+
+    def test_public_bind_is_allowed_when_auth_is_on(self):
+        original_key = server.API_KEY
+        server.API_KEY = "topsecret"
+        try:
+            server.config.set("server.host", "0.0.0.0")
+            with patch.object(server, "_setup_file_logging",
+                              return_value=Path("/tmp/nexus-test.log")), \
+                 patch("uvicorn.run") as run:
+                self.assertEqual(server.main(), 0)
+                run.assert_called_once()
         finally:
             server.API_KEY = original_key
             server.config.set("server.host", "127.0.0.1")
@@ -229,6 +249,39 @@ class SecurityTest(unittest.TestCase):
     def test_cors_is_not_wildcard(self):
         origins = server.config.get("server.cors_origins")
         self.assertNotIn("*", origins)
+
+    def test_auth_is_on_by_default(self):
+        """No key configured must still mean "closed", not "open"."""
+        original_require = server.config.get("server.require_auth")
+        server.config.set("server.require_auth", None)
+        try:
+            self.assertTrue(server._auth_required())
+        finally:
+            server.config.set("server.require_auth", original_require)
+
+    def test_missing_key_is_rejected_on_by_default(self):
+        response = TestClient(server.app, _anonymous=True).post(
+            "/api/tool", json={"tool": "run_shell", "arguments": {"command": "id"}}
+        )
+        self.assertEqual(response.status_code, 401)
+
+    def test_unauthenticated_memory_read_is_rejected(self):
+        response = TestClient(server.app, _anonymous=True).get("/api/memory")
+        self.assertEqual(response.status_code, 401)
+
+    def test_server_generates_a_key_when_none_is_configured(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = server.Config.load()
+            cfg.path = Path(d) / "config.json"
+            cfg._data["server"]["api_key_env"] = "NEXUS_TEST_UNSET_ENV"
+            key = cfg.ensure_server_api_key()
+            self.assertGreaterEqual(len(key), 32)
+            key_file = Path(d) / "api.key"
+            self.assertEqual(key_file.read_text("utf-8"), key)
+            if hasattr(key_file, "stat"):
+                self.assertEqual(key_file.stat().st_mode & 0o077, 0)
+            # Stable across calls, so clients can read it repeatedly.
+            self.assertEqual(cfg.ensure_server_api_key(), key)
 
     def test_disallowed_origin_gets_no_cors_header(self):
         response = self.client.get("/health", headers={"Origin": "https://evil.example"})

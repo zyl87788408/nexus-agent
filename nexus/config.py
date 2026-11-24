@@ -16,6 +16,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import secrets
 import sys
 from enum import Enum
 from pathlib import Path
@@ -223,7 +224,36 @@ class Config:
     def server_api_key(self) -> str | None:
         env_name = self._data["server"].get("api_key_env")
         value = os.environ.get(env_name) if env_name else None
-        return value or None
+        if value:
+            return value
+        key_file = self.path.parent / "api.key"
+        try:
+            if key_file.is_file():
+                return key_file.read_text("utf-8").strip() or None
+        except OSError:
+            return None
+        return None
+
+    def ensure_server_api_key(self) -> str:
+        """Return the server key, generating one on first run.
+
+        The service used to come up with no authentication at all, which made
+        every endpoint - including the one that runs tools - reachable by any
+        page open in the user's browser. A per-install key file keeps the
+        "just run it" experience: local clients read the same file.
+        """
+        existing = self.server_api_key()
+        if existing:
+            return existing
+        key = secrets.token_urlsafe(32)
+        key_file = self.path.parent / "api.key"
+        key_file.parent.mkdir(parents=True, exist_ok=True)
+        key_file.write_text(key, "utf-8")
+        try:
+            key_file.chmod(0o600)
+        except OSError:
+            pass
+        return key
 
     def resolve_path(self, relative: str) -> Path:
         candidate = Path(relative)

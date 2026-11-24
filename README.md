@@ -152,9 +152,12 @@ every response carries `nexus.simulated`:
 ### OpenAI SDK
 
 ```python
+import pathlib
 from openai import OpenAI
 
-client = OpenAI(base_url="http://127.0.0.1:8085/v1", api_key="not-needed")
+# The key is generated on first start; read it back instead of hardcoding it.
+api_key = pathlib.Path("data/api.key").read_text().strip()
+client = OpenAI(base_url="http://127.0.0.1:8085/v1", api_key=api_key)
 print(client.chat.completions.create(
     model="nexus-local",
     messages=[{"role": "user", "content": "Hello, NEXUS!"}],
@@ -166,6 +169,7 @@ print(client.chat.completions.create(
 ```bash
 curl -N http://127.0.0.1:8085/v1/chat/completions \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $(cat data/api.key)" \
   -d '{"model":"nexus-local","stream":true,"messages":[{"role":"user","content":"Count to five."}]}'
 ```
 
@@ -175,14 +179,27 @@ Each event is a `chat.completion.chunk`, terminated by `data: [DONE]`.
 
 ## Security defaults
 
-* Binds to `127.0.0.1`. The server refuses to start on a public host without an API key.
-* API key (`NEXUS_API_KEY`) required on all mutating endpoints when configured.
-* CORS is an allow-list, never `*`.
+* Binds to `127.0.0.1`.
+* **Authentication is on by default.** On first start the server generates a
+  random key and writes it to `data/api.key` (`0600`). Send it as
+  `Authorization: Bearer <key>`; the `/panel` page asks for it once and keeps it
+  in `localStorage`. Set `NEXUS_API_KEY` to supply your own, or
+  `server.require_auth: false` to opt out (only ever on a loopback bind).
+* CORS is an allow-list, never `*`, and cross-site `Origin`s are rejected on
+  state-changing requests.
 * Config file written `0600`; secrets are stored as environment-variable names, never values.
-* Tools run inside a filesystem jail; shell execution is off unless explicitly granted,
-  and cannot be granted in OFFLINE mode.
+* Tools run inside a filesystem jail. Shell execution is off unless explicitly
+  granted, and cannot be granted in OFFLINE mode.
+* `run_shell` does **not** use a shell. The command is split into an argument
+  vector and must name one of a small allow-list of programs (`echo`, `cat`,
+  `ls`, `grep`, `sed`, `python3`, ...). Shell syntax (`|`, `>`, `$()`, backticks)
+  is rejected rather than interpreted, and interpreters refuse `-c`/`-m`, so
+  only scripts already inside the sandbox can run.
+* Plugins are imported in-process; a plugin directory that is group/world
+  writable or owned by another user is refused at load time.
 
 ```bash
+# Use your own key instead of the generated one
 export NEXUS_API_KEY=your-secret
 python server.py
 ```

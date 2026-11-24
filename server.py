@@ -9,6 +9,7 @@ Security defaults:
 
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import sys
@@ -120,8 +121,21 @@ def _error(status_code: int, message: str, err_type="invalid_request_error",
 
 
 def _auth_required() -> bool:
-    """Evaluated per request so a key set after import takes effect."""
-    return bool(API_KEY) or bool(config.get("server.require_auth", False))
+    """All endpoints are authenticated unless the operator opts out.
+
+    Defaulting to "open" meant a single POST from any page in the user's
+    browser could drive the tools. Auth is now on unless
+    ``server.require_auth`` is explicitly set to false.
+    """
+    configured = config.get("server.require_auth")
+    if configured is None:
+        return True
+    return bool(configured) or bool(API_KEY)
+
+
+def _current_api_key() -> str | None:
+    """The key to compare against: env/file, refreshed if it appeared later."""
+    return API_KEY or config.server_api_key()
 
 
 _LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]"}
@@ -164,7 +178,9 @@ def _authorized(authorization: str | None) -> bool:
     if not authorization:
         return False
     token = authorization.replace("Bearer ", "", 1).strip()
-    return bool(API_KEY) and token == API_KEY
+    key = _current_api_key()
+    # constant-time compare: a plain == leaks the key one byte at a time
+    return bool(key) and hmac.compare_digest(token, key)
 
 
 # ---------------------------------------------------------------- endpoints
@@ -546,6 +562,28 @@ a{color:var(--api);text-decoration:none}
 const $=s=>document.querySelector(s);
 const SRCN={local:"本地",cloud:"云端 API",simulated:"兜底(未就绪)"};
 
+// The service requires an API key by default. Read it from localStorage so the
+// panel keeps working, and ask once on first use. It is never rendered into
+// this page - the page itself is served without auth.
+const KEY_STORE="nexus_api_key";
+function apiKey(){ return localStorage.getItem(KEY_STORE) || ""; }
+function authHeaders(extra){
+  const h = Object.assign({}, extra||{});
+  const k = apiKey();
+  if(k) h["Authorization"]="Bearer "+k;
+  return h;
+}
+async function api(path, opts){
+  opts = opts || {};
+  opts.headers = authHeaders(opts.headers);
+  const r = await fetch(path, opts);
+  if(r.status===401){
+    const k = prompt("该服务需要 API Key\\n（见 data/api.key）");
+    if(k){ localStorage.setItem(KEY_STORE, k.trim()); return api(path, opts); }
+  }
+  return r;
+}
+
 function flash(el,txt,kind){
   el.textContent=txt; el.className="show "+kind;
   clearTimeout(el._t); el._t=setTimeout(()=>el.className="",4200);
@@ -557,7 +595,7 @@ function paint(mode,allowed){
 }
 async function refresh(){
   try{
-    const m=await (await fetch("/api/modes")).json();
+    const m=await (await api("/api/modes")).json();
     paint(m.current,m.cloud_allowed);
     $("#s-mode").textContent={offline:"本地模型",auto:"自动",online:"云端 API"}[m.current]||m.current;
     $("#s-allow").innerHTML = m.cloud_allowed
@@ -565,7 +603,7 @@ async function refresh(){
     $("#s-cloud").innerHTML = m.cloud_enabled
       ? '<span class="ok">已启用</span>' : '<span class="bad">未启用</span>';
 
-    const s=await (await fetch("/api/status")).json();
+    const s=await (await api("/api/status")).json();
     const src=s.active_source||"—";
     $("#s-src").textContent=SRCN[src]||src;
     $("#s-src").className="v "+(src==="local"?"ok":src==="cloud"?"":"warn");
@@ -574,7 +612,7 @@ async function refresh(){
       ? '<span class="warn">未检测到可用模型</span>'
       : '<span class="ok">就绪</span>';
 
-    const c=await (await fetch("/api/cloud")).json();
+    const c=await (await api("/api/cloud")).json();
     $("#s-key").innerHTML = c.has_key
       ? '<span class="ok">已保存</span>' : '<span class="bad">未设置</span>';
     if(document.activeElement!==$("#i-url"))   $("#i-url").value=c.base_url||"";
@@ -591,7 +629,7 @@ async function setMode(mode){
   if(mode==="offline") body.allow_cloud=false;
 
   try{
-    const r=await fetch("/api/mode",{method:"POST",
+    const r=await api("/api/mode",{method:"POST",
       headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
     const d=await r.json();
     if(!r.ok){ flash($("#msg"),"切换失败："+(d.detail||d.message||r.status),"err"); return; }
@@ -616,7 +654,7 @@ $("#save").onclick=async()=>{
   const mdl=$("#i-model").value.trim(); if(mdl)   body.model=mdl;
   const key=$("#i-key").value.trim();   if(key)   body.api_key=key;
   try{
-    const r=await fetch("/api/cloud",{method:"POST",
+    const r=await api("/api/cloud",{method:"POST",
       headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
     const d=await r.json();
     if(!r.ok){ flash($("#msg2"),"保存失败："+(d.detail||r.status),"err"); return; }
@@ -755,18 +793,29 @@ def main() -> int:
     host = config.get("server.host", "127.0.0.1")
     port = int(config.get("server.port", 8085))
 
-    # Refuse to expose an unauthenticated service on a public interface.
-    if host not in {"127.0.0.1", "localhost", "::1"} and not API_KEY:
+    global API_KEY
+    auth_on = _auth_required()
+    if auth_on and not _current_api_key():
+        try:
+            API_KEY = config.ensure_server_api_key()
+        except OSError as exc:
+            print(f"ERROR: cannot create the API key file: {exc}", file=sys.stderr)
+            return 2
+
+    # Defence in depth: a public interface must never be unauthenticated.
+    if host not in {"127.0.0.1", "localhost", "::1"} and not auth_on:
         print(
-            f"ERROR: refusing to bind {host} without NEXUS_API_KEY set.\n"
-            "Set the API key, or bind 127.0.0.1 for local-only use.",
+            f"ERROR: refusing to bind {host} without authentication.\n"
+            "Leave server.require_auth on, or bind 127.0.0.1 for local-only use.",
             file=sys.stderr,
         )
         return 2
 
     log_file = _setup_file_logging()
     print(f"NEXUS listening on http://{host}:{port} (mode={config.mode.value}, "
-          f"auth={'on' if API_KEY else 'off'})")
+          f"auth={'on' if auth_on else 'off'})")
+    if auth_on:
+        print(f"API key: {(config.path.parent / 'api.key')}")
     print(f"log file: {log_file}")
     uvicorn.run(app, host=host, port=port, log_config=None)
     return 0

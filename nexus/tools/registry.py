@@ -206,10 +206,10 @@ def _is_constant_name(name: str) -> bool:
 def _run_shell(sandbox: Sandbox, command: str) -> dict:
     import subprocess
 
-    sandbox.check_command(command)
+    argv = sandbox.prepare_command(command)
     proc = subprocess.run(
-        command, shell=True, cwd=sandbox.root, capture_output=True,
-        text=True, timeout=30,
+        argv, shell=False, cwd=sandbox.root, capture_output=True,
+        text=True, timeout=sandbox.shell_timeout,
     )
     return {"returncode": proc.returncode, "stdout": proc.stdout[:10_000],
             "stderr": proc.stderr[:4_000]}

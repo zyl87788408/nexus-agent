@@ -26,6 +26,9 @@ htmlcov/
 .env.*
 data/*
 !data/.gitkeep
+# Generated server key (written 0600 next to the config)
+api.key
+*.key
 
 # Editor / OS
 .vscode/
