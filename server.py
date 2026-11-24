@@ -13,10 +13,11 @@ import json
 import os
 import sys
 import time
+import urllib.parse
 import uuid
 from pathlib import Path
 
-from fastapi import FastAPI, Header
+from fastapi import FastAPI, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
@@ -121,6 +122,40 @@ def _error(status_code: int, message: str, err_type="invalid_request_error",
 def _auth_required() -> bool:
     """Evaluated per request so a key set after import takes effect."""
     return bool(API_KEY) or bool(config.get("server.require_auth", False))
+
+
+_LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]"}
+
+
+def _same_origin(request: Request) -> bool:
+    """Reject cross-site browser requests aimed at the local service.
+
+    With no API key the service is open to anything that can reach the port.
+    Binding to 127.0.0.1 stops other machines but not the user's own browser:
+    any page they open can POST to /api/tool and run commands. Browsers send
+    Origin on cross-site POST, so refuse anything whose Origin is not one of
+    our own addresses. Requests without Origin (curl, scripts, the desktop
+    panel) are unaffected.
+    """
+    origin = request.headers.get("origin")
+    if not origin:
+        return True
+    parsed = urllib.parse.urlparse(origin)
+    return (parsed.hostname or "").lower() in _LOCAL_HOSTS
+
+
+async def _guard(request: Request, call_next):
+    if request.method not in {"GET", "HEAD", "OPTIONS"} and not _same_origin(request):
+        return JSONResponse(
+            status_code=403,
+            content={"error": {"message": "cross-origin request refused",
+                               "type": "permission_error",
+                               "code": "cross_origin_blocked"}},
+        )
+    return await call_next(request)
+
+
+app.middleware("http")(_guard)
 
 
 def _authorized(authorization: str | None) -> bool:

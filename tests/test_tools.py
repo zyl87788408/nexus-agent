@@ -138,6 +138,23 @@ class ToolRegistryTest(unittest.TestCase):
             result = self.registry.call("python_eval", expression=expr)
             self.assertFalse(result.ok, expr)
 
+    def test_eval_blocks_attribute_walk_to_os(self):
+        """``.__class__`` chains reach real classes; they must not be reachable."""
+        for expr in ("().__class__.__bases__",
+                     "[].__class__.__base__.__subclasses__()",
+                     "().__class__.__base__.__subclasses__()[0].__init__",
+                     "getattr(1, '__class__')",
+                     "''.__class__.__mro__[1]"):
+            result = self.registry.call("python_eval", expression=expr)
+            self.assertFalse(result.ok, expr)
+
+    def test_eval_still_allows_safe_calls(self):
+        for expr, expected in (("sum([1, 2, 3])", 6), ("max(3, 7)", 7),
+                               ("len('hello')", 5), ("abs(-4)", 4)):
+            result = self.registry.call("python_eval", expression=expr)
+            self.assertTrue(result.ok, expr)
+            self.assertEqual(result.output, expected)
+
     def test_shell_tool_not_granted_by_default(self):
         result = self.registry.call("run_shell", command="echo hi")
         self.assertFalse(result.ok)

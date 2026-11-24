@@ -148,18 +148,35 @@ def build_default_registry(sandbox: Sandbox | None = None,
 
 
 _ALLOWED_NODES = {
-    "Expression", "BinOp", "UnaryOp", "Num", "Constant", "Str", "Name",
-    "Load", "Add", "Sub", "Mult", "Div", "FloorDiv", "Mod", "Pow",
+    "Expression", "BinOp", "UnaryOp", "Constant", "Name", "Load",
+    "Add", "Sub", "Mult", "Div", "FloorDiv", "Mod", "Pow",
     "USub", "UAdd", "Compare", "Eq", "NotEq", "Lt", "LtE", "Gt", "GtE",
-    "BoolOp", "And", "Or", "UnaryNot", "Not", "IfExp", "Call", "Attribute",
-    "List", "Tuple", "Dict", "Subscript",
+    "BoolOp", "And", "Or", "Not", "IfExp", "Call", "List", "Tuple", "Dict",
+}
+
+# Functions a calculation is allowed to reach. Anything else - and every
+# attribute access - stays out of reach, so an expression cannot walk
+# ``().__class__.__bases__`` into the interpreter and call os.system().
+_SAFE_CALLABLES = {
+    "abs": abs, "min": min, "max": max, "sum": sum, "round": round,
+    "len": len, "int": int, "float": float, "str": str, "bool": bool,
+    "sorted": sorted, "pow": pow, "divmod": divmod,
 }
 
 
 def _safe_eval(expression: str) -> Any:
-    """Evaluate arithmetic without exposing builtins or imports."""
+    """Evaluate a pure arithmetic/string expression, nothing more.
+
+    The AST whitelist alone is not a boundary: allowing ``Attribute`` plus
+    ``Call`` lets ``().__class__.__base__.__subclasses__()`` return real
+    classes, and one more subscript reaches a frame's globals - i.e. arbitrary
+    code execution. Attribute access is therefore banned outright, calls are
+    limited to a fixed set of builtins, and dunder names are rejected.
+    """
     import ast
 
+    if len(expression) > 2_000:
+        raise ValueError("expression is too long")
     try:
         tree = ast.parse(expression, mode="eval")
     except SyntaxError as exc:
@@ -169,7 +186,21 @@ def _safe_eval(expression: str) -> Any:
             raise ValueError(
                 f"expression uses disallowed construct {type(node).__name__}"
             )
-    return eval(compile(tree, "<nexus-eval>", "eval"), {"__builtins__": {}}, {})
+        if isinstance(node, ast.Name):
+            if node.id.startswith("__") or node.id not in _SAFE_CALLABLES and \
+                    not _is_constant_name(node.id):
+                raise ValueError(f"unknown name {node.id!r}")
+        if isinstance(node, ast.Call):
+            if not isinstance(node.func, ast.Name) or node.func.id not in _SAFE_CALLABLES:
+                raise ValueError("expression may only call a few builtins")
+            if node.keywords:
+                raise ValueError("keyword arguments are not supported")
+    return eval(compile(tree, "<nexus-eval>", "eval"),
+                {"__builtins__": {}}, dict(_SAFE_CALLABLES))
+
+
+def _is_constant_name(name: str) -> bool:
+    return name in {"True", "False", "None"}
 
 
 def _run_shell(sandbox: Sandbox, command: str) -> dict:
